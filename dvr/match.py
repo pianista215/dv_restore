@@ -121,8 +121,20 @@ class Matcher:
 
 
 class Union:
-    def __init__(self, n):
+    """Union-find que se niega a juntar dos lecturas de la misma captura.
+
+    Una captura no puede leer dos veces el mismo frame de cinta. Si un
+    emparejamiento lo pretende, es falso, y ademas es venenoso: fusionar los
+    frames f y f+5 de una captura convierte la cadena que los une en un CICLO,
+    y con el orden topologico un ciclo temprano bloquea todo lo que viene
+    detras. Medido en el arranque de esta cinta: dos fusiones asi dejaban el
+    84% de los grupos sin ordenar por topologia.
+    """
+
+    def __init__(self, n, cap_of=None):
         self.p = list(range(n))
+        self.caps = [{cap_of(i)} if cap_of else set() for i in range(n)]
+        self.refused = 0
 
     def find(self, a):
         while self.p[a] != a:
@@ -132,8 +144,14 @@ class Union:
 
     def union(self, a, b):
         ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.p[rb] = ra
+        if ra == rb:
+            return ra
+        if self.caps[ra] & self.caps[rb]:
+            self.refused += 1
+            return None
+        self.p[rb] = ra
+        self.caps[ra] |= self.caps[rb]
+        self.caps[rb] = set()
         return ra
 
 
@@ -159,7 +177,10 @@ def build_index(caps, probes=162, min_audio=20, candidates=40, verbose=True,
     m = Matcher(caps, probes, min_audio, candidates)
     base = np.cumsum([0] + [c.n for c in caps])
     total = int(base[-1])
-    uf = Union(total)
+    owner = np.zeros(total, dtype=np.int32)
+    for ci, cap in enumerate(caps):
+        owner[int(base[ci]):int(base[ci]) + cap.n] = ci
+    uf = Union(total, cap_of=lambda i: int(owner[i]))
     gid = lambda ci, f: int(base[ci]) + f
 
     links = conflicts = 0
@@ -178,10 +199,11 @@ def build_index(caps, probes=162, min_audio=20, candidates=40, verbose=True,
                     continue
                 ok, _, _ = m.same_tape_frame(ci, f, cj, g)
                 if ok:
-                    if uf.find(gid(ci, f)) != uf.find(gid(cj, g)):
-                        links += 1
-                    uf.union(gid(ci, f), gid(cj, g))
-                    done.add(cj)
+                    same = uf.find(gid(ci, f)) == uf.find(gid(cj, g))
+                    if same or uf.union(gid(ci, f), gid(cj, g)) is not None:
+                        if not same:
+                            links += 1
+                        done.add(cj)
         if verbose:
             print(f"  {cap.name}: {cap.n} frames emparejados")
 
@@ -233,6 +255,7 @@ def build_index(caps, probes=162, min_audio=20, candidates=40, verbose=True,
             keep.append(k)
         order = keep
     stats = dict(clusters=len(clusters), links=links + extra, conflicts=conflicts,
+                 refused=uf.refused,
                  total_reads=total, refined=extra, dropped_empty=dropped_empty,
                  emitted=len(order),
                  shared=sum(1 for g in clusters if len(g) > 1))
@@ -306,7 +329,8 @@ def _refine(m, caps, uf, gid, clusters, cid, order, window, audio_only,
             if hit is None:
                 continue
             g, only_aud = hit
-            uf.union(gid(ci, f), gid(cj, g))
+            if uf.union(gid(ci, f), gid(cj, g)) is None:
+                continue
             seq[cj, k] = g
             added += 1
             by_audio += only_aud
@@ -404,20 +428,30 @@ def _topo_order(clusters, cid, caps, spine=0):
     heapq.heapify(ready)
     out = []
     seen = set()
-    while ready:
+    forced = 0
+    pending = set(range(n))
+    while len(out) < n:
+        if not ready:
+            # Queda un ciclo. Se fuerza SOLO el nodo mas prometedor (el de
+            # menor posicion estimada entre los que menos les falta) y se
+            # sigue: tirar de golpe todo lo que queda detras, como se hacia
+            # antes, dejaba el 84% del arranque ordenado solo por posicion.
+            if not pending:
+                break
+            a = min(pending, key=lambda k: (indeg[k], float(key[k])))
+            heapq.heappush(ready, (float(key[a]), a))
+            forced += 1
         _, a = heapq.heappop(ready)
         if a in seen:
             continue
         seen.add(a)
+        pending.discard(a)
         out.append(a)
         for b in succ.get(a, ()):
             indeg[b] -= 1
             if indeg[b] <= 0 and b not in seen:
                 heapq.heappush(ready, (float(key[b]), b))
-    if len(out) < n:
-        rest = sorted((k for k in range(n) if k not in seen),
-                      key=lambda k: float(key[k]))
-        out += rest
+    _topo_order.forced = forced
     return out
 
 

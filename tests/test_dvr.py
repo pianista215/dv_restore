@@ -244,6 +244,50 @@ class TestOrder(unittest.TestCase):
         # y el frame 0 de la base sigue siendo el primero
         self.assertEqual(order[0], 0)
 
+    def test_union_refuses_same_capture(self):
+        """Una captura no puede leer dos veces el mismo frame de cinta.
+
+        Aceptar esa union convertia la cadena que separa los dos frames en un
+        CICLO, y con el orden topologico un ciclo temprano bloquea todo lo que
+        va detras: en el arranque de la cinta dejaba el 84% de los grupos sin
+        ordenar por topologia.
+        """
+        from dvr.match import Union
+        # 5 lecturas: 0 y 1 de la captura A, 2 y 3 de la B, 4 de la C
+        cap = {0: 0, 1: 0, 2: 1, 3: 1, 4: 2}
+        uf = Union(5, cap_of=lambda i: cap[i])
+        self.assertIsNotNone(uf.union(0, 2))     # A0 con B0: bien
+        self.assertIsNone(uf.union(0, 1))        # A0 con A1: misma captura
+        self.assertIsNone(uf.union(1, 2))        # A1 con el grupo que ya tiene A
+        self.assertEqual(uf.refused, 2)
+        self.assertIsNotNone(uf.union(0, 4))     # C cabe
+        self.assertEqual(uf.find(4), uf.find(2))
+        self.assertNotEqual(uf.find(1), uf.find(0))
+
+    def test_topo_order_breaks_cycles_locally(self):
+        """Un ciclo no debe arrastrar a todo lo que va detras."""
+        from dvr.match import _topo_order
+
+        class Cap:
+            def __init__(self, n):
+                self.n = n
+
+        # cadena 0->1->2->3->4 con un ciclo entre 1 y 2 (dos capturas que se
+        # contradicen), y una cola larga detras que NO debe desordenarse
+        clusters = [[(0, 0)], [(0, 1), (1, 1)], [(0, 2), (1, 0)],
+                    [(0, 3)], [(0, 4)]]
+        cid = {}
+        for k, g in enumerate(clusters):
+            for r in g:
+                cid[r] = k
+        order = _topo_order(clusters, cid, [Cap(5), Cap(2)])
+        self.assertEqual(len(order), 5)
+        self.assertEqual(len(set(order)), 5)
+        rank = {c: i for i, c in enumerate(order)}
+        # la cola detras del ciclo sigue en orden
+        self.assertLess(rank[3], rank[4])
+        self.assertEqual(order[0], 0)
+
     def test_topo_order_survives_a_cycle(self):
         from dvr.match import _topo_order
 
