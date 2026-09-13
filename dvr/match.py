@@ -525,3 +525,28 @@ def window_clips(base, donor_paths, lo, hi, out_dir, tag, margin=30,
             print(f"  {cap.name}: {matched} casan -> recorte {a}..{a+n-1} "
                   f"({n} frames, {n/25:.0f}s)  [{time.time()-t0:.0f}s]")
     return made
+
+
+def align_to_tape(idx, cap_index, out_path):
+    """Escribe una captura estirada a la linea temporal real de la cinta.
+
+    Por cada frame de cinta emite la lectura de esa captura si la tiene, y si
+    no repite la ultima. Asi se ve como se reproduciria de verdad: donde la
+    captura perdio frames, la imagen se queda congelada. Puesto al lado del
+    resultado fundido, es lo que ensena de un vistazo cuanto material se ha
+    recuperado.
+    """
+    prof = idx.caps[cap_index].prof
+    last = None
+    missing = 0
+    with open(out_path, "wb") as fh:
+        for k in range(len(idx)):
+            mine = [f for c, f in idx.reads(k) if c == cap_index]
+            if mine:
+                last = idx.caps[cap_index].frame(mine[0])
+            else:
+                missing += 1
+            if last is None:
+                continue
+            fh.write(last.tobytes())
+    return missing

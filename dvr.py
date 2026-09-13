@@ -436,6 +436,42 @@ def cmd_window(args):
     return 0
 
 
+def cmd_preview(args):
+    """Comparativa en video: la captura original estirada a la linea temporal
+    real de la cinta, al lado del resultado."""
+    import subprocess
+    from dvr.match import load_index, align_to_tape
+    idx = load_index(args.index)
+    names = [c.name for c in idx.caps]
+    ci = next((i for i, n in enumerate(names) if args.capture in n), None)
+    if ci is None:
+        print(f"no encuentro '{args.capture}' entre: {', '.join(names)}")
+        return 1
+    tmp = os.path.splitext(args.out)[0] + "_alineado.dv"
+    missing = align_to_tape(idx, ci, tmp)
+    print(f"{names[ci]} estirado a la cinta: {len(idx)} frames, "
+          f"{missing} congelados porque esa captura no los tiene")
+    lab = ["drawtext=text='%s':x=12:y=h-34:fontsize=22:fontcolor=white:"
+           "box=1:boxcolor=black@0.6:boxborderw=6" % t
+           for t in ("ORIGINAL  (congela donde perdio frames)", "RESTAURADO")]
+    fc = (f"[0:v]setpts=N/25/TB,{lab[0]}[a];"
+          f"[1:v]setpts=N/25/TB,{lab[1]}[b];[a][b]hstack=inputs=2[v]")
+    cmd = ["ffmpeg", "-v", "error", "-y",
+           "-f", "dv", "-i", tmp, "-f", "dv", "-i", args.result,
+           "-filter_complex", fc, "-map", "[v]", "-map", "1:a:0",
+           "-c:v", "libx264", "-crf", str(args.crf), "-preset", "veryfast",
+           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+           "-shortest", args.out]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode:
+        print(r.stderr.decode(errors="replace")[-1500:])
+        return 1
+    if not args.keep:
+        os.remove(tmp)
+    print(f"{args.out}  ({os.path.getsize(args.out)/1e6:.0f} MB)")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="dvr.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -522,6 +558,17 @@ def main():
     p.add_argument("--per-frame", type=int, default=120)
     p.add_argument("--max-dist", type=int, default=6)
     p.set_defaults(func=cmd_calconceal)
+
+    p = sub.add_parser("preview",
+                       help="video comparativo original / restaurado")
+    p.add_argument("result")
+    p.add_argument("--index", required=True)
+    p.add_argument("--capture", default="parte1",
+                   help="que captura se pone a la izquierda")
+    p.add_argument("--out", required=True)
+    p.add_argument("--crf", type=int, default=20)
+    p.add_argument("--keep", action="store_true")
+    p.set_defaults(func=cmd_preview)
 
     p = sub.add_parser("png", help="exporta frames a PNG")
     p.add_argument("file")
