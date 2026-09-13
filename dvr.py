@@ -243,13 +243,19 @@ def cmd_merge(args):
     print(f"fundiendo frames de cinta {lo}..{hi-1} de {len(idx)}")
     tot_before = tot_after = added = 0
     multi_before = multi_after = multi_n = 0
+    prev_canvas = None
+    flips = 0
     agg = {}
     t0 = time.time()
     with open(args.out, "wb") as fh:
         for k in range(lo, hi):
             reads = [mg.Read(idx.caps[c].frame(f), prof, c, f)
                      for c, f in idx.reads(k)]
-            out, info = mg.merge_frame(reads, prof)
+            out, info = mg.merge_frame(reads, prof, prefer=prev_canvas,
+                                       hysteresis=args.hysteresis)
+            if prev_canvas is not None and info["canvas_cap"] != prev_canvas:
+                flips += 1
+            prev_canvas = info["canvas_cap"]
             best = min(r.n_bad for r in reads)
             tot_before += best
             tot_after += info["unresolved"]
@@ -268,6 +274,8 @@ def cmd_merge(args):
     tot = n * prof.n_video
     print(f"\nframes escritos                : {n}  ({n/25:.1f}s)")
     print(f"  con una sola lectura         : {added}")
+    print(f"el lienzo cambia de captura en : {flips} de {n-1} transiciones "
+          f"({100*flips/max(n-1,1):.0f}%)")
     print(f"segmentos sin tocar            : {agg['kept']}")
     print(f"segmentos copiados enteros     : {agg['copied']}")
     print(f"segmentos vueltos a empaquetar : {agg['repacked']}")
@@ -316,6 +324,8 @@ def cmd_conceal(args):
     print(f"  dejados: la zona se mueve  : {rep['motion_reject']:8d}")
     print(f"  dejados: ningun frame vecino lo tiene sano : {rep['no_source']:8d}")
     print(f"  dejados: sin vecinos sanos con que medir   : {rep['no_support']:8d}")
+    print(f"  de los tapados, por puente entre frames buenos: {rep['bridged']:8d}"
+          f"   (frames ocultados enteros por la camara)")
     w = rep["win_used"]
     print(f"  ventana usada (radio 3/6/12/frame): {w[0]}/{w[1]}/{w[2]}/{w[3]}")
     d = rep["diffs"]
@@ -540,6 +550,8 @@ def main():
     p.add_argument("--index", default="work/index.json")
     p.add_argument("--out", required=True)
     p.add_argument("--range")
+    p.add_argument("--hysteresis", type=float, default=0.20,
+                   help="cuanto peor se consiente al lienzo anterior antes de cambiarlo")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_merge)
 

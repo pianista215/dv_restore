@@ -12,6 +12,14 @@ El problema practico es que el dano viene en manchas grandes: seis de cada diez
 macrobloques rotos no tienen NI UN vecino sano a su alrededor con el que medir.
 Por eso la ventana crece por escalones hasta encontrar apoyo suficiente, y el
 umbral se relaja a medida que la medida se vuelve mas global y menos fiable.
+
+Y el caso peor son los frames ocultados ENTEROS por la camara, que no tienen ni
+un macrobloque sano: ahi no hay nada dentro del frame con que medir. Son justo
+los que mas se notan, porque caen entre frames bien restaurados y el ojo ve un
+tiron. Para esos se mide el movimiento entre los dos frames BUENOS que lo
+rodean: si la escena no se mueve de uno a otro, tampoco se mueve en medio, y
+rellenar es seguro. El error que se espera cometer se estima repartiendo ese
+movimiento en proporcion a la distancia.
 """
 
 import numpy as np
@@ -90,6 +98,7 @@ def conceal_sequence(frames, prof, max_dist=6, thr=5.0, min_nb=6,
 
     check = [0, 0]
     trimmed = 0
+    bridged = bridged_try = 0
     filled = motion_reject = no_source = no_support = 0
     seg_copied = seg_repacked = 0
     used_win = np.zeros(len(WINDOWS), np.int64)
@@ -102,6 +111,9 @@ def conceal_sequence(frames, prof, max_dist=6, thr=5.0, min_nb=6,
         cand = [j for d in range(1, max_dist + 1) for j in (i - d, i + d)
                 if 0 <= j < n]
         pm = {}
+        pm2 = {}
+        # el frame no tiene con que medir por dentro: hara falta el puente
+        blind = int((~bad).sum()) < min_nb
         src = np.full(prof.n_video, -1, np.int64)
         for k in np.nonzero(bad)[0]:
             r, c = int(rows[k]), int(cols[k])
@@ -121,6 +133,27 @@ def conceal_sequence(frames, prof, max_dist=6, thr=5.0, min_nb=6,
                     break
                 if best is not None and best[1] == j and best[0] < 0.5:
                     break
+            if best is None and blind:
+                # puente: los dos frames buenos que rodean a este
+                j1 = next((j for j in range(i - 1, max(-1, i - max_dist - 1), -1)
+                           if not info[j].bad[k]), None)
+                j2 = next((j for j in range(i + 1, min(n, i + max_dist + 1))
+                           if not info[j].bad[k]), None)
+                if j1 is not None and j2 is not None:
+                    key = (j1, j2)
+                    if key not in pm2:
+                        pm2[key] = PairMotion(info[j1], info[j2], prof)
+                    for w, (win, fac) in enumerate(zip(WINDOWS, WIN_FACTOR)):
+                        dd, cnt = pm2[key].at(r, c, win)
+                        if dd is None or cnt < min_nb:
+                            continue
+                        near = j1 if (i - j1) <= (j2 - i) else j2
+                        # el movimiento medido cubre j2-j1 frames; al copiar
+                        # desde el mas cercano solo se hereda su parte
+                        est = dd * abs(i - near) / max(j2 - j1, 1)
+                        best = (est / fac, near, w, est)
+                        break
+                    bridged_try += 1
             if best is None:
                 if not any(not info[j].bad[k] for j in cand):
                     no_source += 1
@@ -134,6 +167,8 @@ def conceal_sequence(frames, prof, max_dist=6, thr=5.0, min_nb=6,
                 src[k] = best[1]
                 used_win[best[2]] += 1
                 filled += 1
+                if blind:
+                    bridged += 1
 
         segs = np.nonzero((src.reshape(prof.n_seg, 5) >= 0).any(axis=1))[0]
         if len(segs) == 0:
@@ -182,7 +217,7 @@ def conceal_sequence(frames, prof, max_dist=6, thr=5.0, min_nb=6,
     rep = dict(filled=filled, motion_reject=motion_reject,
                no_source=no_source, no_support=no_support,
                seg_copied=seg_copied, seg_repacked=seg_repacked,
-               win_used=used_win.tolist(),
+               win_used=used_win.tolist(), bridged=bridged,
                invalid_written=check[0], overflow=check[1], trimmed=trimmed,
                diffs=np.array(diffs) if diffs else np.zeros(0))
     return out, rep

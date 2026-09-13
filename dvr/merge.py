@@ -62,23 +62,38 @@ class Read:
         return self.seg_ok & ~self.seg_bad
 
 
-def merge_frame(reads, prof, order=None):
+def merge_frame(reads, prof, order=None, prefer=None, hysteresis=0.20):
     """Funde varias lecturas del mismo frame de cinta.
 
-    Devuelve (frame, info) donde info trae el recuento de lo que se ha hecho y
-    el estado final de cada macrobloque.
+    El LIENZO es la lectura que se toma de base y de la que salen el subcodigo,
+    el audio y los macrobloques que no tiene sana ninguna. Elegir siempre el
+    menos danado hace que el lienzo vaya saltando de una captura a otra, y como
+    cada camara oculta sus errores a su manera, eso parpadea: medido, cuando el
+    lienzo cambia la diferencia entre frames consecutivos sube de 7,5 a 11,3.
+
+    Por eso, si la lectura que fue lienzo en el frame anterior sigue estando
+    razonablemente sana, se mantiene. 'hysteresis' es cuanto peor se le
+    consiente ser (0.20 = hasta un 20% mas de macrobloques danados).
     """
     if len(reads) == 1:
         r = reads[0]
         return r.frame.copy(), dict(kept=prof.n_seg, copied=0, repacked=0,
                                     unresolved=int((r.sta != 0).sum()),
                                     lost=0, bad_pack=0, canvas=0,
-                                    final_bad=(r.sta != 0))
+                                    canvas_cap=r.cap, final_bad=(r.sta != 0))
 
     if order is None:
         order = sorted(range(len(reads)),
                        key=lambda i: (reads[i].n_bad, reads[i].n_false))
     canvas = order[0]
+    if prefer is not None:
+        keep = [i for i in order if reads[i].cap == prefer]
+        if keep:
+            i = keep[0]
+            best = reads[canvas].n_bad
+            if reads[i].n_bad <= best * (1.0 + hysteresis) + 8:
+                canvas = i
+                order = [i] + [j for j in order if j != i]
     out = reads[canvas].frame.copy()
     ids = prof.video[:, None] + np.arange(3)[None, :]
     canvas_ids = reads[canvas].frame[ids]
@@ -148,4 +163,5 @@ def merge_frame(reads, prof, order=None):
 
     return out, dict(kept=kept, copied=copied, repacked=repacked,
                      unresolved=unresolved, lost=lost, bad_pack=bad_pack,
-                     canvas=canvas, final_bad=final_bad)
+                     canvas=canvas, canvas_cap=reads[canvas].cap,
+                     final_bad=final_bad)
