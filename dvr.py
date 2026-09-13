@@ -396,6 +396,46 @@ def cmd_calconceal(args):
     return 0
 
 
+def cmd_triage(args):
+    from dvr.dvfile import Capture
+    from dvr.match import triage
+    base = Capture(args.base)
+    recs = triage(base, args.donors, probes=args.probes,
+                  min_audio=args.min_audio, candidates=args.candidates)
+    useful = [r for r in recs if r["matched"] >= args.min_matched]
+    print(f"\n--- resumen ---")
+    print(f"donantes con solape util (>= {args.min_matched} frames): "
+          f"{len(useful)} de {len(recs)}")
+    tot = sum(r["matched"] for r in useful)
+    print(f"frames de donante que casan con la base: {tot}")
+    if useful:
+        lo = min(r["base_lo"] for r in useful)
+        hi = max(r["base_hi"] for r in useful)
+        print(f"tramo de la base cubierto: {lo}..{hi} "
+              f"({(hi-lo+1)/25:.0f}s de {base.n/25:.0f}s)")
+    if args.out:
+        import json
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w") as fh:
+            json.dump(recs, fh, indent=1)
+        print(f"\ndetalle en {args.out}")
+    return 0
+
+
+def cmd_window(args):
+    from dvr.dvfile import Capture
+    from dvr.match import window_clips
+    base = Capture(args.base)
+    made = window_clips(base, args.donors, args.start,
+                        args.start + args.count - 1, args.out, args.tag,
+                        margin=args.margin, probes=args.probes,
+                        min_audio=args.min_audio, candidates=args.candidates,
+                        min_matched=args.min_matched)
+    tot = sum(os.path.getsize(p) for p in made)
+    print(f"\n{len(made)} recortes, {tot/1e9:.2f} GB en {args.out}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="dvr.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -413,6 +453,32 @@ def main():
     p.add_argument("files", nargs="+")
     p.add_argument("--frames", type=int, default=400)
     p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("triage",
+                       help="que donantes solapan con la base, y en que tramo")
+    p.add_argument("base")
+    p.add_argument("donors", nargs="+")
+    p.add_argument("--probes", type=int, default=162)
+    p.add_argument("--min-audio", type=int, default=20)
+    p.add_argument("--candidates", type=int, default=40)
+    p.add_argument("--min-matched", type=int, default=25)
+    p.add_argument("--out", default="")
+    p.set_defaults(func=cmd_triage)
+
+    p = sub.add_parser("window",
+                       help="recorta un tramo de la base y el equivalente de cada donante")
+    p.add_argument("base")
+    p.add_argument("donors", nargs="+")
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--count", type=int, default=750)
+    p.add_argument("--margin", type=int, default=30)
+    p.add_argument("--probes", type=int, default=162)
+    p.add_argument("--min-audio", type=int, default=20)
+    p.add_argument("--candidates", type=int, default=40)
+    p.add_argument("--min-matched", type=int, default=15)
+    p.add_argument("--tag", default="w")
+    p.add_argument("--out", default="clips")
+    p.set_defaults(func=cmd_window)
 
     p = sub.add_parser("clip", help="recortes alineados de varias capturas")
     p.add_argument("files", nargs="+")
