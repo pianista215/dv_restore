@@ -259,7 +259,7 @@ def cmd_merge(args):
                 multi_n += 1
                 multi_before += best
                 multi_after += info["unresolved"]
-            for key in ("kept", "copied", "repacked", "lost"):
+            for key in ("kept", "copied", "repacked", "lost", "bad_pack"):
                 agg[key] = agg.get(key, 0) + info[key]
             fh.write(out.tobytes())
             if args.verbose and (k - lo) % 100 == 0:
@@ -271,7 +271,9 @@ def cmd_merge(args):
     print(f"segmentos sin tocar            : {agg['kept']}")
     print(f"segmentos copiados enteros     : {agg['copied']}")
     print(f"segmentos vueltos a empaquetar : {agg['repacked']}")
-    print(f"palabras VLC perdidas al empaquetar: {agg['lost']}")
+    print(f"coeficientes recortados por falta de sitio: {agg['lost']}")
+    print(f"segmentos que no cupieron: {agg['bad_pack']}  "
+          f"{'(debe ser 0)' if agg['bad_pack'] else 'OK'}")
     mt = multi_n * prof.n_video
     print(f"\n--- frames con MAS DE UNA lectura ({multi_n}) ---")
     if mt:
@@ -289,6 +291,108 @@ def cmd_merge(args):
     if tot_before:
         print(f"recuperado                 : {100*(tot_before-tot_after)/tot_before:.1f}%")
     print(f"\n{time.time()-t0:.0f}s   salida: {args.out}")
+    return 0
+
+
+def cmd_conceal(args):
+    from dvr.dvfile import Capture
+    from dvr import conceal
+    import time
+    cap = Capture(args.file)
+    prof = cap.prof
+    before = sum(cap.n_bad(i) for i in range(cap.n))
+    t0 = time.time()
+    out, rep = conceal.conceal_sequence(
+        cap.data, prof, max_dist=args.max_dist,
+        thr=args.threshold, min_nb=args.min_neighbours,
+        progress=lambda i, n: print(f"  {i}/{n}...") if args.verbose else None)
+    with open(args.out, "wb") as fh:
+        for f in out:
+            fh.write(f.tobytes())
+    after = sum(int((f[prof.sta] >> 4 != 0).sum()) for f in out)
+    tot = cap.n * prof.n_video
+    print(f"macrobloques rotos antes  : {before:8d}  ({100*before/tot:6.3f}%)")
+    print(f"  tapados por copia temporal : {rep['filled']:8d}")
+    print(f"  dejados: la zona se mueve  : {rep['motion_reject']:8d}")
+    print(f"  dejados: ningun frame vecino lo tiene sano : {rep['no_source']:8d}")
+    print(f"  dejados: sin vecinos sanos con que medir   : {rep['no_support']:8d}")
+    w = rep["win_used"]
+    print(f"  ventana usada (radio 3/6/12/frame): {w[0]}/{w[1]}/{w[2]}/{w[3]}")
+    d = rep["diffs"]
+    if len(d):
+        print(f"  diferencia de DC medida: mediana {np.median(d):.1f}  "
+              f"p25 {np.percentile(d,25):.1f}  p75 {np.percentile(d,75):.1f}")
+    print(f"segmentos copiados enteros : {rep['seg_copied']}, "
+          f"repaquetizados: {rep['seg_repacked']}")
+    print(f"coeficientes recortados por falta de sitio: {rep['trimmed']}")
+    print(f"segmentos escritos que NO vuelven a parsear: {rep['invalid_written']}"
+          f"  {'(debe ser 0)' if rep['invalid_written'] else 'OK'}")
+    print(f"macrobloques rotos despues: {after:8d}  ({100*after/tot:6.3f}%)")
+    if before:
+        print(f"reduccion                 : {100*(before-after)/before:.1f}%")
+    print(f"\n{time.time()-t0:.0f}s   salida: {args.out}")
+    return 0
+
+
+def cmd_calconceal(args):
+    """Calibra la puerta de movimiento contra verdad de campo.
+
+    Toma macrobloques que estan SANOS, hace como si estuvieran rotos, aplica la
+    misma regla de copia y compara con el original. Asi el umbral deja de ser
+    una corazonada y pasa a ser una eleccion medida.
+    """
+    from dvr.dvfile import Capture
+    from dvr import dcplane, shuffle
+    from dvr.conceal import FrameInfo, PairMotion, WINDOWS, WIN_FACTOR
+    cap = Capture(args.file)
+    prof = cap.prof
+    n = cap.n
+    table = shuffle.load(prof)
+    pos = np.asarray(table, np.int64)
+    rows, cols = pos // prof.mb_cols, pos % prof.mb_cols
+    info = [FrameInfo(cap.frame(i), prof, table) for i in range(n)]
+    dcs = [dcplane.dc_raw(cap.frame(i), prof)[:, :4].mean(axis=1) for i in range(n)]
+    rng = np.random.default_rng(3)
+    rec = []
+    for i in range(2, n - 2):
+        ok = np.nonzero(~info[i].bad)[0]
+        if not len(ok):
+            continue
+        sel = rng.choice(ok, size=min(args.per_frame, len(ok)), replace=False)
+        pm = {}
+        for k in sel:
+            r, c = int(rows[k]), int(cols[k])
+            best = None
+            for d in range(1, args.max_dist + 1):
+                for j in (i - d, i + d):
+                    if not (0 <= j < n) or info[j].bad[k]:
+                        continue
+                    if j not in pm:
+                        pm[j] = PairMotion(info[i], info[j], prof)
+                    for w, (win, fac) in enumerate(zip(WINDOWS, WIN_FACTOR)):
+                        dd, cnt = pm[j].at(r, c, win)
+                        if dd is None or cnt < 6:
+                            continue
+                        sc = dd / fac
+                        if best is None or sc < best[0]:
+                            best = (sc, j)
+                        break
+                if best is not None:
+                    break
+            if best is None:
+                continue
+            rec.append((best[0], abs(float(dcs[i][k]) - float(dcs[best[1]][k]))))
+    rec = np.array(rec)
+    sc, err = rec[:, 0], rec[:, 1]
+    print(f"muestras con verdad de campo: {len(rec)}")
+    print("\numbral  se tapa   err mediana   err p90   copias con err>20")
+    for t in (2, 3, 4, 5, 6, 8, 10, 12, 16):
+        m = sc <= t
+        if m.sum() < 20:
+            continue
+        print(f"{t:6d}  {100*m.mean():6.1f}%  {np.median(err[m]):11.1f}  "
+              f"{np.percentile(err[m],90):8.1f}  {100*(err[m]>20).mean():14.1f}%")
+    print("\n(unidades de DC; 1 DC equivale a ~0,58 niveles de luma)")
     return 0
 
 
@@ -336,6 +440,22 @@ def main():
     p.add_argument("--range")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_merge)
+
+    p = sub.add_parser("conceal", help="tapa lo que quedo roto con frames vecinos")
+    p.add_argument("file")
+    p.add_argument("--out", required=True)
+    p.add_argument("--max-dist", type=int, default=6)
+    p.add_argument("--threshold", type=float, default=8.0)
+    p.add_argument("--min-neighbours", type=int, default=6)
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=cmd_conceal)
+
+    p = sub.add_parser("calconceal",
+                       help="calibra la puerta de movimiento con verdad de campo")
+    p.add_argument("file")
+    p.add_argument("--per-frame", type=int, default=120)
+    p.add_argument("--max-dist", type=int, default=6)
+    p.set_defaults(func=cmd_calconceal)
 
     p = sub.add_parser("png", help="exporta frames a PNG")
     p.add_argument("file")

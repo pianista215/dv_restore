@@ -1,4 +1,9 @@
-"""Decodificar DV a imagen con ffmpeg, y volcar PNG."""
+"""Decodificar DV a imagen con ffmpeg, y volcar PNG.
+
+Con ec=0 se desactiva la ocultacion de errores del propio decodificador. Sirve
+para ver el estado REAL del flujo: con la ocultacion puesta, ffmpeg disimula
+gran parte del dano y las comparativas parecen todas iguales.
+"""
 
 import subprocess
 import numpy as np
@@ -6,7 +11,7 @@ import numpy as np
 from .layout import profile_for
 
 
-def decode(frame_bytes, prof, planes="yuv"):
+def decode(frame_bytes, prof, planes="yuv", ec=None):
     """Decodifica uno o varios frames DV a numpy.
 
     Devuelve (n, h, w) uint8 con la luma si planes='y', o
@@ -18,8 +23,9 @@ def decode(frame_bytes, prof, planes="yuv"):
         pix, depth = "rgb24", 3
     else:
         pix, depth = "gray", 1
+    pre = [] if ec is None else ["-ec", str(ec)]
     p = subprocess.run(
-        ["ffmpeg", "-v", "error", "-f", "dv", "-i", "pipe:0",
+        ["ffmpeg", "-v", "error"] + pre + ["-f", "dv", "-i", "pipe:0",
          "-f", "rawvideo", "-pix_fmt", pix, "pipe:1"],
         input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     need = n * prof.height * prof.width * depth

@@ -24,6 +24,7 @@ import numpy as np
 
 from . import dcplane, native
 from .bitstream import EOB
+from .fixup import sanitize_mb, fit_segment
 
 # calidad de un macrobloque como origen, de mejor a peor
 SRC_CLEAN = 3      # sano y en un segmento cuyo bitstream decodifica
@@ -61,33 +62,6 @@ class Read:
         return self.seg_ok & ~self.seg_bad
 
 
-def _sanitize(blk):
-    """Deja un bloque DCT en un estado emitible.
-
-    Si viene de un segmento que no decodifica, solo valen las palabras leidas
-    dentro de su area fija; el resto puede ser basura colada por el
-    desbordamiento. Se corta ahi y se cierra con EOB.
-    """
-    n = int(blk.ntok_area)
-    if not blk.done or int(blk.ntok) != n:
-        toks = [int(blk.tok[i]) for i in range(min(n, int(blk.ntok)))]
-        pos = 0
-        keep = []
-        for t in toks:
-            from .bitstream import VLC_RUN
-            pos += int(VLC_RUN[t]) + 1
-            if pos >= 64:
-                keep.append(t)
-                break
-            keep.append(t)
-        if not keep or pos < 64:
-            keep.append(EOB)
-        for i, t in enumerate(keep):
-            blk.tok[i] = t
-        blk.ntok = len(keep)
-        blk.done = 1
-
-
 def merge_frame(reads, prof, order=None):
     """Funde varias lecturas del mismo frame de cinta.
 
@@ -98,7 +72,7 @@ def merge_frame(reads, prof, order=None):
         r = reads[0]
         return r.frame.copy(), dict(kept=prof.n_seg, copied=0, repacked=0,
                                     unresolved=int((r.sta != 0).sum()),
-                                    lost=0, canvas=0,
+                                    lost=0, bad_pack=0, canvas=0,
                                     final_bad=(r.sta != 0))
 
     if order is None:
@@ -113,7 +87,7 @@ def merge_frame(reads, prof, order=None):
     full = [r.seg_full() for r in reads]
     final_bad = reads[canvas].sta != 0
 
-    kept = copied = repacked = unresolved = lost = 0
+    kept = copied = repacked = unresolved = lost = bad_pack = 0
     for s in range(prof.n_seg):
         if full[canvas][s]:
             kept += 1
@@ -149,28 +123,29 @@ def merge_frame(reads, prof, order=None):
             i = best[m]
             if qual[i][s * 5 + m] == SRC_NONE:
                 nres += 1
-                base.mb[m] = segs[canvas].mb[m] if canvas in segs else base.mb[m]
-                base.mb[m].sta = 0x0F
+                src_i = canvas if canvas in segs else best[0]
+                base.mb[m] = segs[src_i].mb[m]
+                base.mb[m].sta = 0x0E
                 final_bad[s * 5 + m] = True
-                for j in range(6):
-                    _sanitize(base.mb[m].b[j])
+                sanitize_mb(base.mb[m], bool(segs[src_i].ok))
                 continue
             base.mb[m] = segs[i].mb[m]
             base.mb[m].sta = 0
             final_bad[s * 5 + m] = False
-            for j in range(6):
-                _sanitize(base.mb[m].b[j])
+            sanitize_mb(base.mb[m], bool(segs[i].ok))
         for m in range(5):
             o = int(prof.seg[s, m])
             base.mb[m].id[0] = int(canvas_ids[s * 5 + m][0])
             base.mb[m].id[1] = int(canvas_ids[s * 5 + m][1])
             base.mb[m].id[2] = int(canvas_ids[s * 5 + m][2])
+        lost += max(0, fit_segment(base))
         buf, nlost = native.pack(base, bytes(reads[canvas].frame[off:off + 400]))
         out[off:off + 400] = np.frombuffer(buf, np.uint8)
         repacked += 1
         unresolved += nres
-        lost += nlost
+        if nlost:
+            bad_pack += 1
 
     return out, dict(kept=kept, copied=copied, repacked=repacked,
-                     unresolved=unresolved, lost=lost, canvas=canvas,
-                     final_bad=final_bad)
+                     unresolved=unresolved, lost=lost, bad_pack=bad_pack,
+                     canvas=canvas, final_bad=final_bad)
