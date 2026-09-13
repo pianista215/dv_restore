@@ -209,6 +209,41 @@ class TestOrder(unittest.TestCase):
         self.assertEqual(len(order), 4)
         self.assertEqual(order, [0, 1, 2, 3])
 
+    def test_chains_are_not_interleaved(self):
+        """Dos capturas enlazadas por pocas anclas no deben intercalarse.
+
+        Es el fallo que metia frames de momentos distintos alternados: al
+        desempatar por el numero de frame CRUDO, el frame 1 de una captura se
+        colaba junto al frame 1 de otra aunque correspondieran a puntos de
+        cinta lejanos. El desempate tiene que ser la posicion estimada.
+        """
+        from dvr.match import _topo_order, estimate_position
+
+        class Cap:
+            def __init__(self, n):
+                self.n = n
+
+        # captura 0 (columna vertebral): frames 0,1,2,3
+        # captura 1: su frame 0 casa con el 1 de la base, y su frame 3 con el 2
+        #            -> sus frames 1 y 2 van ENTRE medias, no al principio
+        clusters = [[(0, 0)], [(0, 1), (1, 0)], [(1, 1)], [(1, 2)],
+                    [(0, 2), (1, 3)], [(0, 3)]]
+        cid = {}
+        for k, g in enumerate(clusters):
+            for r in g:
+                cid[r] = k
+        caps = [Cap(4), Cap(4)]
+        pos = estimate_position(clusters, cid, caps, spine=0)
+        self.assertTrue(pos[1] < pos[2] < pos[4], f"posiciones raras: {pos}")
+        self.assertTrue(pos[2] < pos[3] < pos[4], f"posiciones raras: {pos}")
+        order = _topo_order(clusters, cid, caps)
+        rank = {c: i for i, c in enumerate(order)}
+        self.assertLess(rank[1], rank[2])
+        self.assertLess(rank[3], rank[4])
+        self.assertLess(rank[4], rank[5])
+        # y el frame 0 de la base sigue siendo el primero
+        self.assertEqual(order[0], 0)
+
     def test_topo_order_survives_a_cycle(self):
         from dvr.match import _topo_order
 

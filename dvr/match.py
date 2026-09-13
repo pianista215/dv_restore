@@ -154,7 +154,8 @@ class TapeIndex:
 
 
 def build_index(caps, probes=162, min_audio=20, candidates=40, verbose=True,
-                refine=True, window=40, audio_only=80, max_tries=4_000_000):
+                refine=True, window=40, audio_only=80, max_tries=4_000_000,
+                drop_empty=0.95):
     m = Matcher(caps, probes, min_audio, candidates)
     base = np.cumsum([0] + [c.n for c in caps])
     total = int(base[-1])
@@ -198,6 +199,7 @@ def build_index(caps, probes=162, min_audio=20, candidates=40, verbose=True,
             conflicts += 1
 
     order = _topo_order(clusters, cid, caps)
+    dropped_empty = 0
     extra = 0
     if refine and len(caps) > 1:
         extra = _refine(m, caps, uf, gid, clusters, cid, order, window,
@@ -213,8 +215,26 @@ def build_index(caps, probes=162, min_audio=20, candidates=40, verbose=True,
                 for r in g:
                     cid[r] = k
             order = _topo_order(clusters, cid, caps)
+    if drop_empty is not None:
+        # Un frame leido por una sola captura y ocultado casi entero por ella no
+        # lleva NI UN dato de cinta: es relleno que solto el deck al patinar.
+        # No es un frame de cinta distinto, y como no tiene datos no puede
+        # verificar contra nada, asi que nunca enlaza y el orden lo coloca donde
+        # quiere, intercalado con el material bueno. Fuera.
+        lim = drop_empty * caps[0].prof.n_video
+        keep = []
+        for k in order:
+            g = clusters[k]
+            if len(g) == 1:
+                ci, f = g[0]
+                if caps[ci].n_bad(f) >= lim:
+                    dropped_empty += 1
+                    continue
+            keep.append(k)
+        order = keep
     stats = dict(clusters=len(clusters), links=links + extra, conflicts=conflicts,
-                 total_reads=total, refined=extra,
+                 total_reads=total, refined=extra, dropped_empty=dropped_empty,
+                 emitted=len(order),
                  shared=sum(1 for g in clusters if len(g) > 1))
     return TapeIndex(caps, clusters, order, stats)
 
@@ -299,12 +319,71 @@ def _refine(m, caps, uf, gid, clusters, cid, order, window, audio_only,
     return added
 
 
-def _topo_order(clusters, cid, caps):
+def estimate_position(clusters, cid, caps, spine=0, rounds=4):
+    """Posicion estimada de cada frame de cinta, en la escala de la captura
+    columna vertebral.
+
+    Hace falta para desempatar el orden. Cuando dos cadenas de frames no estan
+    enlazadas entre si, el orden topologico tiene libertad para intercalarlas, y
+    si se desempata por el numero de frame CRUDO se intercalan momentos
+    distintos de la cinta: cada captura arranca en un punto diferente, asi que
+    ese numero no significa nada entre capturas.
+
+    Aqui se ancla cada grupo que contenga una lectura de la columna vertebral a
+    su numero de frame, y se propaga al resto interpolando dentro de cada
+    captura, que si va en orden. Con eso el desempate es una posicion de cinta
+    de verdad, comparable entre capturas.
+    """
+    n = len(clusters)
+    pos = np.full(n, np.nan)
+    for k, g in enumerate(clusters):
+        for (ci, f) in g:
+            if ci == spine:
+                pos[k] = float(f)
+    if not np.isfinite(pos).any():
+        for k, g in enumerate(clusters):
+            pos[k] = float(min(f for _, f in g))
+        return pos
+    for _ in range(rounds):
+        changed = False
+        for ci, cap in enumerate(caps):
+            ks = np.array([cid[(ci, f)] for f in range(cap.n)])
+            known = np.isfinite(pos[ks])
+            if known.sum() < 2:
+                continue
+            fs = np.nonzero(known)[0].astype(float)
+            ps = pos[ks[known]]
+            # pendiente global de esta captura frente a la columna vertebral,
+            # para poder estimar tambien fuera del tramo con anclas
+            slope = (ps[-1] - ps[0]) / max(fs[-1] - fs[0], 1.0)
+            miss = np.nonzero(~known)[0]
+            if not len(miss):
+                continue
+            est = np.interp(miss.astype(float), fs, ps)
+            left = miss < fs[0]
+            right = miss > fs[-1]
+            est[left] = ps[0] - (fs[0] - miss[left]) * slope
+            est[right] = ps[-1] + (miss[right] - fs[-1]) * slope
+            for m, v in zip(miss, est):
+                k = ks[m]
+                if not np.isfinite(pos[k]):
+                    pos[k] = v
+                    changed = True
+        if not changed:
+            break
+    bad = ~np.isfinite(pos)
+    if bad.any():
+        pos[bad] = np.nanmax(pos[~bad]) + 1.0
+    return pos
+
+
+def _topo_order(clusters, cid, caps, spine=0):
     """Orden de los frames de cinta a partir del orden interno de cada captura.
 
     Cada captura impone que su frame i va antes que el i+1. Se ordena el grafo
-    resultante; si aparece un ciclo (senal de un emparejamiento falso) se rompe
-    por la arista menos sostenida y se sigue.
+    resultante respetando esas aristas, y cuando hay varios grupos disponibles a
+    la vez se elige el de menor posicion estimada de cinta. Si queda algun ciclo
+    (senal de un emparejamiento falso) se anaden por esa misma posicion.
     """
     n = len(clusters)
     succ = defaultdict(Counter)
@@ -318,13 +397,10 @@ def _topo_order(clusters, cid, caps):
         for b in d:
             indeg[b] += 1
 
-    # desempate: posicion media de la lectura mas temprana
-    key = {}
-    for k, g in enumerate(clusters):
-        key[k] = min(f for _, f in g)
+    key = estimate_position(clusters, cid, caps, spine)
 
     import heapq
-    ready = [(key[k], k) for k in range(n) if indeg[k] == 0]
+    ready = [(float(key[k]), k) for k in range(n) if indeg[k] == 0]
     heapq.heapify(ready)
     out = []
     seen = set()
@@ -337,35 +413,13 @@ def _topo_order(clusters, cid, caps):
         for b in succ.get(a, ()):
             indeg[b] -= 1
             if indeg[b] <= 0 and b not in seen:
-                heapq.heappush(ready, (key[b], b))
+                heapq.heappush(ready, (float(key[b]), b))
     if len(out) < n:
-        # quedan ciclos: se anaden por orden de posicion, que es lo mas
-        # parecido al orden real de cinta
-        rest = sorted((k for k in range(n) if k not in seen), key=lambda k: key[k])
+        rest = sorted((k for k in range(n) if k not in seen),
+                      key=lambda k: float(key[k]))
         out += rest
     return out
 
-
-def save_index(idx, path):
-    import json
-    data = dict(
-        captures=[c.path for c in idx.caps],
-        order=[int(k) for k in idx.order],
-        clusters=[[[int(c), int(f)] for c, f in g] for g in idx.clusters],
-        stats={k: int(v) for k, v in idx.stats.items()},
-    )
-    with open(path, "w") as fh:
-        json.dump(data, fh)
-
-
-def load_index(path, caps=None):
-    import json
-    from .dvfile import Capture
-    with open(path) as fh:
-        d = json.load(fh)
-    caps = caps or [Capture(p) for p in d["captures"]]
-    clusters = [[(int(c), int(f)) for c, f in g] for g in d["clusters"]]
-    return TapeIndex(caps, clusters, [int(k) for k in d["order"]], d["stats"])
 
 
 def triage(base, donor_paths, probes=162, min_audio=20, candidates=40,
@@ -450,7 +504,7 @@ def triage(base, donor_paths, probes=162, min_audio=20, candidates=40,
 
 def window_clips(base, donor_paths, lo, hi, out_dir, tag, margin=30,
                  probes=162, min_audio=20, candidates=40, min_matched=15,
-                 verbose=True):
+                 gap=120, verbose=True):
     """Recorta un tramo de la base y el tramo equivalente de cada donante.
 
     Igual que triage, indexa SOLO la base (y solo el tramo pedido), asi que el
@@ -493,8 +547,7 @@ def window_clips(base, donor_paths, lo, hi, out_dir, tag, margin=30,
         if cap.prof is not prof:
             continue
         hd, okd = fingerprints(cap.data, probe)
-        matched = 0
-        dlo = dhi = None
+        hits = []
         for g in range(cap.n):
             v = Counter()
             for p in np.nonzero(okd[g])[0]:
@@ -505,16 +558,34 @@ def window_clips(base, donor_paths, lo, hi, out_dir, tag, margin=30,
             fb = cap.data[g]
             for f, _ in v.most_common(candidates):
                 ok, _, _ = verify_pair(prof, base.data[f], fb, min_audio)
-                if not ok:
-                    continue
-                matched += 1
-                dlo = g if dlo is None else min(dlo, g)
-                dhi = g if dhi is None else max(dhi, g)
-                break
+                if ok:
+                    hits.append(g)
+                    break
         del hd, okd
+        matched = len(hits)
         if matched < min_matched:
             if verbose:
                 print(f"  {cap.name}: {matched} frames en el tramo, se descarta")
+            continue
+        # Quedarse con el GRUPO CONTIGUO mas grande, no con el minimo y el
+        # maximo: un solo emparejamiento espurio lejano estiraba el recorte a
+        # miles de frames de material de otra parte de la cinta, que entraba al
+        # indice sin enlazar con nada y se intercalaba con el bueno.
+        groups = []
+        cur = [hits[0]]
+        for g in hits[1:]:
+            if g - cur[-1] <= gap:
+                cur.append(g)
+            else:
+                groups.append(cur)
+                cur = [g]
+        groups.append(cur)
+        best = max(groups, key=len)
+        dropped = matched - len(best)
+        dlo, dhi = best[0], best[-1]
+        if len(best) < min_matched:
+            if verbose:
+                print(f"  {cap.name}: {matched} sueltos sin grupo contiguo, se descarta")
             continue
         a = max(0, dlo - margin)
         n = min(cap.n - a, dhi - a + 1 + margin)
@@ -522,7 +593,8 @@ def window_clips(base, donor_paths, lo, hi, out_dir, tag, margin=30,
         clip(cap, dst, a, n)
         made.append(dst)
         if verbose:
-            print(f"  {cap.name}: {matched} casan -> recorte {a}..{a+n-1} "
+            extra = f", {dropped} sueltos descartados" if dropped else ""
+            print(f"  {cap.name}: {len(best)} casan{extra} -> recorte {a}..{a+n-1} "
                   f"({n} frames, {n/25:.0f}s)  [{time.time()-t0:.0f}s]")
     return made
 

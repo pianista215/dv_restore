@@ -217,7 +217,10 @@ def cmd_index(args):
                       candidates=args.candidates)
     st = idx.stats
     print(f"\nlecturas totales      : {st['total_reads']}")
-    print(f"frames de cinta       : {st['clusters']}  ({st['clusters']/25:.1f}s)")
+    print(f"frames de cinta       : {st['clusters']}")
+    print(f"  relleno descartado (una lectura, ocultada entera): {st.get('dropped_empty',0)}")
+    print(f"  se emiten             : {st.get('emitted', st['clusters'])}  "
+          f"({st.get('emitted', st['clusters'])/25:.1f}s)")
     print(f"  con mas de una lectura: {st['shared']}")
     print(f"  con lecturas repetidas de la misma captura: {st['conflicts']}")
     for ci, c in enumerate(caps):
@@ -482,6 +485,25 @@ def cmd_preview(args):
     return 0
 
 
+def cmd_runall(args):
+    from dvr.dvfile import Capture
+    from dvr.pipeline import run_windows, concat
+    base = Capture(args.base)
+    cores, total = run_windows(args.base, args.donors, args.out,
+                               width=args.width, step=args.step,
+                               margin=args.margin, thr=args.threshold,
+                               hysteresis=args.hysteresis, budget=args.budget)
+    print(f"\nventanas hechas: {len(cores)} de {total}")
+    if len(cores) < total:
+        print("vuelve a lanzar el mismo comando para seguir donde se quedo")
+        return 0
+    n = concat(cores, args.final, base.prof)
+    print(f"\nmontado: {n} frames ({n/25:.1f}s) -> {args.final}")
+    print(f"la base tenia {base.n} frames ({base.n/25:.1f}s)  "
+          f"-> +{n-base.n} frames recuperados")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="dvr.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -581,6 +603,20 @@ def main():
     p.add_argument("--crf", type=int, default=20)
     p.add_argument("--keep", action="store_true")
     p.set_defaults(func=cmd_preview)
+
+    p = sub.add_parser("runall", help="proceso completo por ventanas, resumible")
+    p.add_argument("base")
+    p.add_argument("donors", nargs="+")
+    p.add_argument("--out", required=True, help="directorio de trabajo")
+    p.add_argument("--final", required=True, help="fichero DV de salida")
+    p.add_argument("--width", type=int, default=750)
+    p.add_argument("--step", type=int, default=600)
+    p.add_argument("--margin", type=int, default=30)
+    p.add_argument("--threshold", type=float, default=8.0)
+    p.add_argument("--hysteresis", type=float, default=0.20)
+    p.add_argument("--budget", type=float, default=0,
+                   help="segundos antes de parar limpiamente (0 = sin limite)")
+    p.set_defaults(func=cmd_runall)
 
     p = sub.add_parser("png", help="exporta frames a PNG")
     p.add_argument("file")
