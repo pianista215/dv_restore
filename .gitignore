@@ -1,0 +1,19 @@
+# Material de vídeo: nunca al repositorio
+*.dv
+*.DV
+*.png
+*.jpg
+*.mkv
+*.mp4
+*.wav
+
+# Directorios de trabajo
+clips/
+work/
+out/
+
+# Python / build
+__pycache__/
+*.pyc
+*.so
+*.o
