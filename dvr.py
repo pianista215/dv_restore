@@ -327,6 +327,8 @@ def cmd_conceal(args):
     print(f"  dejados: la zona se mueve  : {rep['motion_reject']:8d}")
     print(f"  dejados: ningun frame vecino lo tiene sano : {rep['no_source']:8d}")
     print(f"  dejados: sin vecinos sanos con que medir   : {rep['no_support']:8d}")
+    print(f"  de los tapados, rescatados por disparate: {rep['rescued']:8d}"
+          f"   (lo que habia era imagen de otro momento)")
     print(f"  de los tapados, por puente entre frames buenos: {rep['bridged']:8d}"
           f"   (frames ocultados enteros por la camara)")
     w = rep["win_used"]
@@ -580,7 +582,7 @@ def main():
     p = sub.add_parser("conceal", help="tapa lo que quedo roto con frames vecinos")
     p.add_argument("file")
     p.add_argument("--out", required=True)
-    p.add_argument("--max-dist", type=int, default=6)
+    p.add_argument("--max-dist", type=int, default=25)
     p.add_argument("--threshold", type=float, default=20.0)
     p.add_argument("--min-neighbours", type=int, default=6)
     p.add_argument("--verbose", action="store_true")
@@ -590,7 +592,7 @@ def main():
                        help="calibra la puerta de movimiento con verdad de campo")
     p.add_argument("file")
     p.add_argument("--per-frame", type=int, default=120)
-    p.add_argument("--max-dist", type=int, default=6)
+    p.add_argument("--max-dist", type=int, default=25)
     p.set_defaults(func=cmd_calconceal)
 
     p = sub.add_parser("preview",

@@ -14,6 +14,11 @@ error que esa estimacion en todos los tramos de movimiento hasta 40 (a 12-20,
 rechazaban copias que eran mejores, y el resultado eran parpadeos: un frame
 rancio entre dos buenos.
 
+El alcance de la busqueda (max_dist) importa mas de lo que parece: el dano
+llega en RACHAS de frames seguidos. Con una cinta que pierde las secuencias DIF
+pares durante diez frames, buscar origen solo a +-6 deja sin arreglo los del
+medio, y salen como bandas horizontales con imagen de otro momento.
+
 El problema practico es que el dano viene en manchas grandes: seis de cada diez
 macrobloques rotos no tienen NI UN vecino sano a su alrededor con el que medir.
 Por eso la ventana crece por escalones hasta encontrar apoyo suficiente, y el
@@ -40,11 +45,12 @@ WIN_FACTOR = (1.0, 0.85, 0.7, 0.55)
 
 
 class FrameInfo:
-    __slots__ = ("bad", "grid_dc", "grid_ok")
+    __slots__ = ("bad", "grid_dc", "grid_ok", "dcb")
 
     def __init__(self, frame, prof, table):
         self.bad = dcplane.sta(frame, prof) != 0
         dc = dcplane.dc_raw(frame, prof)[:, :4].mean(axis=1)
+        self.dcb = dc
         g = np.zeros(prof.mb_rows * prof.mb_cols, np.float32)
         g[table] = dc
         self.grid_dc = g.reshape(prof.mb_rows, prof.mb_cols)
@@ -90,8 +96,9 @@ class PairMotion:
         return _win_sum(self.Id, r0, r1, c0, c1) / n, int(n)
 
 
-def conceal_sequence(frames, prof, max_dist=6, thr=20.0, min_nb=6,
-                     table=None, progress=None, stats=None, verify=True):
+def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
+                     table=None, progress=None, stats=None, verify=True,
+                     outlier_factor=3.0):
     if table is None:
         table = shuffle.load(prof)
     pos = np.asarray(table, np.int64)
@@ -104,7 +111,7 @@ def conceal_sequence(frames, prof, max_dist=6, thr=20.0, min_nb=6,
 
     check = [0, 0]
     trimmed = 0
-    bridged = bridged_try = 0
+    bridged = bridged_try = rescued = 0
     filled = motion_reject = no_source = no_support = 0
     seg_copied = seg_repacked = 0
     used_win = np.zeros(len(WINDOWS), np.int64)
@@ -167,12 +174,24 @@ def conceal_sequence(frames, prof, max_dist=6, thr=20.0, min_nb=6,
                     no_support += 1
                 continue
             diffs.append(best[3])
-            if best[0] > thr:
+            # Copiar tambien cuando lo que hay puesto es un disparate.
+            # La puerta de movimiento mide cuanto se mueve la escena entre los
+            # dos frames: si la estimacion de la camara para ESTE macrobloque
+            # se aleja mucho mas que eso, no es una estimacion mala, es imagen
+            # de otro momento. Pasa cuando la cinta pierde secuencias DIF
+            # enteras durante una racha larga: salen bandas horizontales con
+            # una escena distinta, y rechazarlas por movimiento no tiene
+            # sentido porque lo que se conserva es peor que cualquier copia.
+            d_keep = abs(float(info[i].dcb[k]) - float(info[best[1]].dcb[k]))
+            outlier = d_keep > outlier_factor * max(best[3], 4.0)
+            if best[0] > thr and not outlier:
                 motion_reject += 1
             else:
                 src[k] = best[1]
                 used_win[best[2]] += 1
                 filled += 1
+                if outlier and best[0] > thr:
+                    rescued += 1
                 if blind:
                     bridged += 1
 
@@ -224,6 +243,7 @@ def conceal_sequence(frames, prof, max_dist=6, thr=20.0, min_nb=6,
                no_source=no_source, no_support=no_support,
                seg_copied=seg_copied, seg_repacked=seg_repacked,
                win_used=used_win.tolist(), bridged=bridged,
+               rescued=rescued,
                invalid_written=check[0], overflow=check[1], trimmed=trimmed,
                diffs=np.array(diffs) if diffs else np.zeros(0))
     return out, rep
