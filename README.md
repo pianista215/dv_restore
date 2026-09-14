@@ -58,27 +58,54 @@ equivoca de verdad es en las zonas con movimiento, y ahí copiar del frame
 vecino sería igual de erróneo. Está implementada y calibrada, pero **el valor
 está en tener más pasadas**, no en inventar.
 
-## Flujo de trabajo
+## Cómo lanzarlo
+
+Requisitos: Python 3 con numpy y Pillow, ffmpeg y gcc. Nada más; el acelerador
+en C se compila solo la primera vez.
+
+### El caso normal: restaurar una captura con todas las demás
 
 ```bash
-# 1. verificar el parser y calibrar el barajado (una sola vez)
+# 1. que donantes solapan de verdad, y en que tramo (solo lectura, no escribe)
+python3 dvr.py triage MALA.dv OTRAS*.dv --out work/triage.json
+
+# 2. proceso completo. Es resumible: si se corta, relanza el mismo comando
+python3 dvr.py runall MALA.dv OTRAS*.dv \
+        --out /ruta/con/espacio/trabajo \
+        --final /ruta/con/espacio/restaurada.dv
+
+# 3. comparativa en video: el original estirado a la linea temporal real de la
+#    cinta (congela donde perdio frames) junto al resultado
+python3 dvr.py preview restaurada.dv --index work/w.json --out comparativa.mp4
+```
+
+`runall` trocea la base en ventanas de 750 frames con paso 600 y cose por el
+centro: una sola ventana con todos los donantes no cabe en memoria ni en
+tiempo. Cada ventana deja su tramo en `<out>/cores/`, así que lo ya hecho no se
+repite. Con `--budget SEGUNDOS` para limpiamente para poder trocearlo.
+
+### Para iterar y depurar
+
+```bash
+# verificar el parser y calibrar el barajado (una sola vez por perfil)
 python3 dvr.py calib captura.dv --shuffle
 
-# 2. recortes cortos alineados entre capturas, para iterar en segundos
-python3 dvr.py clip a.dv b.dv c.dv --ref b.dv --start 250 --count 250 --tag hard
+# recortar una ventana con todos sus donantes, para iterar en segundos
+python3 dvr.py window MALA.dv OTRAS*.dv --start 1550 --count 750 --out clips
 
-# 3. ver el estado
-python3 dvr.py scan clips/hard_*.dv
-python3 dvr.py map clips/hard_a.dv --frames 21     # mapa de daño sobre la imagen
+# ver el estado
+python3 dvr.py scan clips/*.dv
+python3 dvr.py map clips/w_MALA.dv --frames 21   # mapa de daño sobre la imagen
 
-# 4. índice de frames de cinta y fusión
-python3 dvr.py index clips/hard_*.dv --out work/hard.json
-python3 dvr.py merge --index work/hard.json --out out/merged.dv
-
-# 5. ocultación (opcional, aporta poco: ver arriba)
-python3 dvr.py calconceal out/merged.dv        # elegir el umbral con datos
+# paso a paso
+python3 dvr.py index clips/w_*.dv --out work/w.json
+python3 dvr.py merge --index work/w.json --out out/merged.dv
+python3 dvr.py calconceal out/merged.dv          # elegir el umbral con datos
 python3 dvr.py conceal out/merged.dv --out out/final.dv --threshold 8
 ```
+
+**Todo lo grande va a `--out`.** Los `.dv` de origen se abren solo lectura y no
+se tocan nunca.
 
 ## Invariantes que se comprueban
 
