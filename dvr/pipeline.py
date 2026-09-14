@@ -22,6 +22,7 @@ import numpy as np
 
 from . import conceal as cc
 from . import merge as mg
+from . import outliers
 from .dvfile import Capture
 from .match import build_index, window_clips
 
@@ -102,6 +103,7 @@ def run_windows(base_path, donor_paths, out_dir, width=750, step=600,
         k0, k1 = _core_range(idx, bi, 0, step, first, last)
 
         frames = []
+        nreads = []
         prev_canvas = None
         for k in range(len(idx)):
             reads = [mg.Read(idx.caps[c].frame(f), prof, c, f)
@@ -110,6 +112,19 @@ def run_windows(base_path, donor_paths, out_dir, width=750, step=600,
                                        hysteresis=hysteresis)
             prev_canvas = info["canvas_cap"]
             frames.append(out)
+            nreads.append(len(reads))
+
+        # fuera los frames que no encajan donde han quedado, ANTES de ocultar:
+        # asi la ocultacion ve vecinos buenos
+        drop = outliers.find_misplaced(frames, nreads, prof)
+        if drop:
+            dset = set(drop)
+            shift = np.cumsum([1 if i in dset else 0 for i in range(len(frames))])
+            frames = [f for i, f in enumerate(frames) if i not in dset]
+            k0 = int(k0 - (shift[k0 - 1] if k0 > 0 else 0))
+            k1 = int(k1 - (shift[k1 - 1] if k1 > 0 else 0))
+            if verbose:
+                print(f"  descartados {len(drop)} frames fuera de sitio")
         cleaned, rep = cc.conceal_sequence(frames, prof, max_dist=max_dist,
                                            thr=thr)
         tmp = core + ".part"

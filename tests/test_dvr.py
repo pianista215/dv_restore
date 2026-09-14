@@ -189,6 +189,34 @@ class TestFixup(unittest.TestCase):
         self.assertEqual(int(b.tok[int(b.ntok) - 1]), bs.EOB)
 
 
+class TestOutliers(unittest.TestCase):
+    def test_finds_a_frame_that_does_not_belong(self):
+        """Un frame colado entre dos que son casi iguales sobra; uno intermedio
+        de una panoramica, no."""
+        from dvr.outliers import find_misplaced
+        from dvr.layout import PAL
+
+        class Fake:
+            """Frame sintetico: DC constante y todos los macrobloques rotos."""
+            def __init__(self, level):
+                self.buf = np.zeros(PAL.frame_size, np.uint8)
+                off = PAL.video[:, None] + np.array([4, 18, 32, 46])[None, :]
+                self.buf[off] = level          # DC alto de cada bloque de luma
+                self.buf[PAL.sta] = 0xE0       # marcados rotos
+
+        def f(level):
+            return Fake(level).buf
+
+        # una panoramica: 10, 20, 30 -> el de en medio SI va ahi
+        pan = [f(10), f(20), f(30)]
+        self.assertEqual(find_misplaced(pan, [1, 1, 1], PAL), [])
+        # un intruso: 10, 90, 11 -> los extremos casi iguales, el de en medio no
+        bad = [f(10), f(90), f(11)]
+        self.assertEqual(find_misplaced(bad, [1, 1, 1], PAL), [1])
+        # el mismo intruso, pero bien sostenido por varias lecturas: no se toca
+        self.assertEqual(find_misplaced(bad, [1, 6, 1], PAL), [])
+
+
 class TestOrder(unittest.TestCase):
     def test_topo_order_with_gaps(self):
         from dvr.match import _topo_order
