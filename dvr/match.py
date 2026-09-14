@@ -47,22 +47,33 @@ def fingerprints(data, probe, chunk=CHUNK):
     return hs, ok
 
 
-def verify_pair(prof, fa, fb, min_audio=20):
+def verify_pair(prof, fa, fb, min_audio=20, min_blocks=20, min_ratio=0.90):
     """Son la misma lectura de cinta?
 
-    Estricto a proposito: TODOS los bloques de video sanos que ambos comparten
-    tienen que coincidir byte a byte, y ademas hay que tener respaldo del
-    audio, porque en una escena quieta dos frames distintos comparten bloques
-    de video identicos y sin el audio se emparejan mal.
+    Se exige que coincida byte a byte la GRAN MAYORIA de los bloques de video
+    sanos que ambos comparten, no todos. Exigirlos todos parecia lo riguroso,
+    pero rechazaba emparejamientos buenos: la camara marca como sanos algunos
+    bloques que no lo son, asi que dos lecturas del mismo frame de cinta
+    discrepan en un puñado. Medido en este material, el mismo frame da una
+    proporcion de 1,000 (percentil 1 tambien 1,000) y dos frames de cinta
+    distintos dan 0,000, asi que el umbral es holgado.
+
+    Rechazar esos emparejamientos era caro: las lecturas no enlazadas quedaban
+    como cadena paralela y se intercalaban una a una con las buenas, que es lo
+    que se ve como microrepeticiones y parpadeos.
+
+    Ademas hay que tener respaldo del audio, porque en una escena quieta dos
+    frames distintos comparten bloques de video identicos.
 
     Devuelve (es_la_misma, bloques_sanos_comunes, bloques_de_audio_iguales).
     """
     both = ((fa[prof.sta] >> 4) == 0) & ((fb[prof.sta] >> 4) == 0)
     n = int(both.sum())
-    if n < 6:
+    if n < min_blocks:
         return False, n, 0
     idx = prof.vdata[both]
-    if not bool((fa[idx] == fb[idx]).all()):
+    same = int((fa[idx] == fb[idx]).all(axis=1).sum())
+    if same < min_ratio * n:
         return False, n, 0
     aud = int((fa[prof.adata] == fb[prof.adata]).all(axis=1).sum())
     return aud >= min_audio, n, aud
@@ -83,10 +94,13 @@ def probe_set(prof, probes, seed=20240913):
 
 
 class Matcher:
-    def __init__(self, caps, probes=162, min_audio=20, candidates=40):
+    def __init__(self, caps, probes=162, min_audio=20, candidates=40,
+                 min_blocks=20, min_ratio=0.90):
         self.caps = caps
         self.prof = caps[0].prof
         self.min_audio = min_audio
+        self.min_blocks = min_blocks
+        self.min_ratio = min_ratio
         self.candidates = candidates
         self.probe = probe_set(self.prof, probes)
         self.hs, self.ok = [], []
@@ -117,7 +131,8 @@ class Matcher:
 
     def same_tape_frame(self, ci, f, cj, g):
         return verify_pair(self.prof, self.caps[ci].data[f],
-                           self.caps[cj].data[g], self.min_audio)
+                           self.caps[cj].data[g], self.min_audio,
+                           self.min_blocks, self.min_ratio)
 
 
 class Union:
@@ -324,7 +339,7 @@ def _refine(m, caps, uf, gid, clusters, cid, order, window, audio_only,
                 if ok:
                     hit = (g, False)
                     break
-                if n < 6 and aud >= audio_only:
+                if n < m.min_blocks and aud >= audio_only:
                     hit = (g, True)
             if hit is None:
                 continue

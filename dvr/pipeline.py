@@ -55,7 +55,7 @@ def _core_range(idx, cap_index, off_lo, off_hi, first, last):
 
 
 def run_windows(base_path, donor_paths, out_dir, width=750, step=600,
-                margin=30, thr=8.0, max_dist=6, hysteresis=0.20,
+                margin=30, thr=20.0, max_dist=6, hysteresis=0.20,
                 budget=None, verbose=True):
     base = Capture(base_path)
     prof = base.prof

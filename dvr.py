@@ -581,7 +581,7 @@ def main():
     p.add_argument("file")
     p.add_argument("--out", required=True)
     p.add_argument("--max-dist", type=int, default=6)
-    p.add_argument("--threshold", type=float, default=8.0)
+    p.add_argument("--threshold", type=float, default=20.0)
     p.add_argument("--min-neighbours", type=int, default=6)
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_conceal)
@@ -612,7 +612,7 @@ def main():
     p.add_argument("--width", type=int, default=750)
     p.add_argument("--step", type=int, default=600)
     p.add_argument("--margin", type=int, default=30)
-    p.add_argument("--threshold", type=float, default=8.0)
+    p.add_argument("--threshold", type=float, default=20.0)
     p.add_argument("--hysteresis", type=float, default=0.20)
     p.add_argument("--budget", type=float, default=0,
                    help="segundos antes de parar limpiamente (0 = sin limite)")

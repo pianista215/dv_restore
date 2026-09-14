@@ -4,9 +4,15 @@ No se inventa imagen: se copia el mismo macrobloque de un frame vecino del
 propio material, y solo cuando hay pruebas de que esa zona del cuadro esta
 quieta. La prueba sale del plano DC, que se lee sin decodificar el bitstream:
 se comparan los macrobloques SANOS que rodean al roto entre el frame de destino
-y el candidato. Si apenas cambian, la zona esta quieta y copiar es seguro; si
-se mueve, se deja marcado y que lo oculte el reproductor, que es mejor que
-congelar algo que se mueve.
+y el candidato.
+
+El umbral no compara contra la perfeccion, sino contra la ALTERNATIVA, que no
+es dejarlo en blanco: es la estimacion que ya hizo la camara, y que suele ser
+un trozo de un frame viejo. Medido con verdad de campo, la copia tiene menos
+error que esa estimacion en todos los tramos de movimiento hasta 40 (a 12-20,
+8,0 frente a 12,0) y solo pierde por encima. Con un umbral prudente se
+rechazaban copias que eran mejores, y el resultado eran parpadeos: un frame
+rancio entre dos buenos.
 
 El problema practico es que el dano viene en manchas grandes: seis de cada diez
 macrobloques rotos no tienen NI UN vecino sano a su alrededor con el que medir.
@@ -84,7 +90,7 @@ class PairMotion:
         return _win_sum(self.Id, r0, r1, c0, c1) / n, int(n)
 
 
-def conceal_sequence(frames, prof, max_dist=6, thr=5.0, min_nb=6,
+def conceal_sequence(frames, prof, max_dist=6, thr=20.0, min_nb=6,
                      table=None, progress=None, stats=None, verify=True):
     if table is None:
         table = shuffle.load(prof)
