@@ -144,26 +144,64 @@ def encode_block(px, qno, cls=0):
     return dc, c, _tokens_for(levels)
 
 
-def encode_mb(seg, m, luma, qno=None, cls=None):
+def _put_block(b, dc, c, toks):
+    b.dc = dc
+    b.mode = 0
+    b.cls = c
+    n = min(len(toks), 69)
+    for i in range(n):
+        b.tok[i] = toks[i]
+    if toks[n - 1] != EOB:        # el terminador no se pierde nunca
+        b.tok[n] = EOB
+        n += 1
+    b.ntok = n
+    b.ntok_area = n
+    b.pos = 128
+    b.done = 1
+
+
+def encode_mb(seg, m, luma, qno=None, cls=None, max_bits=None):
     """Mete un 16x16 de luma en el macrobloque m de un segmento ya parseado.
 
     Solo toca los cuatro bloques de luma; el croma se deja como estaba, que es
     lo correcto cuando el macrobloque de origen ya trae su croma.
+
+    Si se da 'max_bits', el bloque se abarata (clases mas gruesas) hasta caber
+    en ese presupuesto. Hace falta: si el macrobloque reconstruido ocupa mas
+    que el que habia, algo tiene que ceder, y lo que cedia antes era el bloque
+    con mas coeficientes del segmento, que suele ser el croma de un VECINO
+    SANO. Se veia como macrobloques con el color disparatado. Lo que tiene que
+    encoger es lo nuestro.
     """
+    from .bitstream import VLC_LEN, HDR_BITS
     if qno is None:
         qno = int(seg.mb[m].qno)
+    base = [int(b.cls) if cls is None else cls for b in
+            (seg.mb[m].b[j] for j in range(4))]
+    # De la clase original a las mas baratas, en ese orden. _class_order deja
+    # primero la de partida y detras las de factor mayor (niveles mas pequenos
+    # = menos bits), asi que hay que recorrerla en orden y quedarse con la
+    # PRIMERA que quepa, no seguir hasta el final: los ultimos pasos son mas
+    # caros y comprometerse con ellos era peor que no hacer nada.
+    orders = [_class_order(qno, base[j]) for j in range(4)]
+    steps = max(len(o) for o in orders)
+    last = None
+    for step in range(steps):
+        out = []
+        bits = 0
+        for j in range(4):
+            c = orders[j][min(step, len(orders[j]) - 1)]
+            r, cc = QUAD[j]
+            dc, c, toks = encode_block(luma[r:r + 8, cc:cc + 8], qno, c)
+            out.append((dc, c, toks))
+            bits += HDR_BITS + int(sum(int(VLC_LEN[t]) for t in toks))
+        if last is None or bits < last[0]:
+            last = (bits, out)
+        if max_bits is None or bits <= max_bits:
+            last = (bits, out)
+            break
+    bits, out = last
     for j in range(4):
-        b = seg.mb[m].b[j]
-        c = int(b.cls) if cls is None else cls
-        r, cc = QUAD[j]
-        dc, c, toks = encode_block(luma[r:r + 8, cc:cc + 8], qno, c)
-        b.dc = dc
-        b.mode = 0
-        b.cls = c
-        for i, t in enumerate(toks[:70]):
-            b.tok[i] = t
-        b.ntok = min(len(toks), 70)
-        b.ntok_area = b.ntok
-        b.pos = 128
-        b.done = 1
+        _put_block(seg.mb[m].b[j], *out[j])
     seg.mb[m].qno = qno
+    return bits

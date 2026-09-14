@@ -65,8 +65,16 @@ def segment_bits(seg):
     return total
 
 
-def fit_segment(seg, capacity=SEG_CAPACITY_BITS):
+def fit_segment(seg, capacity=SEG_CAPACITY_BITS, protect=()):
     """Recorta coeficientes hasta que el segmento quepa.
+
+    'protect' son macrobloques que NO hay que tocar: los que no hemos
+    sustituido y estan sanos. Sin esa proteccion, al meter un macrobloque
+    reconstruido que ocupa mas bits, el recorte iba a por el bloque con mas
+    coeficientes del segmento, y ese suele ser el croma de un VECINO SANO: se
+    sacrificaba un bloque bueno para meter el nuestro, y salia con el color
+    disparatado. Medido: 5 macrobloques por cada 10 frames con saturacion
+    absurda, y 4 de cada 5 estaban sanos.
 
     Al juntar macrobloques de origenes distintos sus coeficientes pueden no
     caber en los 380 bytes del segmento. Si se empaqueta sin mas, lo que se
@@ -84,13 +92,19 @@ def fit_segment(seg, capacity=SEG_CAPACITY_BITS):
         return 0
     eob_len = int(VLC_LEN[EOB])
     dropped = 0
+    prot = set(protect)
     while total > capacity:
         best = None
-        for m in range(5):
-            for j in range(6):
-                b = seg.mb[m].b[j]
-                if int(b.ntok) >= 2 and (best is None or b.ntok > best.ntok):
-                    best = b
+        for allow_prot in (False, True):
+            for m in range(5):
+                if not allow_prot and m in prot:
+                    continue
+                for j in range(6):
+                    b = seg.mb[m].b[j]
+                    if int(b.ntok) >= 2 and (best is None or b.ntok > best.ntok):
+                        best = b
+            if best is not None:
+                break
         if best is None:
             return -1
         n = int(best.ntok)

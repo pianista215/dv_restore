@@ -36,7 +36,7 @@ movimiento en proporcion a la distancia.
 import numpy as np
 
 from . import dcplane, native, shuffle
-from .fixup import sanitize_mb, fit_segment
+from .fixup import sanitize_mb, fit_segment, SEG_CAPACITY_BITS as SEG_CAPACITY
 from . import interp as _interp
 from . import encode as _encode
 
@@ -155,6 +155,25 @@ class PairMotion:
         return _win_sum(self.Id, r0, r1, c0, c1) / n, int(n)
 
 
+def _budget_for(seg, m):
+    """Bits que le quedan a un macrobloque sin quitarselos a los demas."""
+    from .bitstream import VLC_LEN, HDR_BITS
+    used = 0
+    for mm in range(5):
+        if mm == m:
+            continue
+        for j in range(6):
+            b = seg.mb[mm].b[j]
+            used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
+                                       for i in range(int(b.ntok))))
+    # los dos bloques de croma del propio macrobloque no se tocan
+    for j in (4, 5):
+        b = seg.mb[m].b[j]
+        used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
+                                   for i in range(int(b.ntok))))
+    return max(0, SEG_CAPACITY - used)
+
+
 def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                      table=None, progress=None, stats=None, verify=True,
                      outlier_factor=3.0, compensate=True, interpolate=True,
@@ -191,7 +210,7 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
         return mvcache[key]
     bridged = bridged_try = rescued = shifted = 0
     filled = motion_reject = no_source = no_support = 0
-    seg_copied = seg_repacked = 0
+    seg_copied = seg_repacked = seg_reverted = 0
     used_win = np.zeros(len(WINDOWS), np.int64)
     diffs = []
 
@@ -334,12 +353,25 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                 seg_copied += 1
                 continue
             dst = native.parse(bytes(out[i][off:off + 400]))
-            trust = bool(dst.ok)
+            # Solo se confia en el desbordamiento del segmento si ademas de
+            # parsear NO habia ningun macrobloque roto en el. Un segmento con
+            # un macrobloque danado parsea igual, pero su basura vive en el
+            # deposito compartido y la continuacion de los vecinos sanos la
+            # lee. Mientras el segmento tenia STA mezclado el decodificador
+            # ignoraba ese deposito; al repararlo y marcarlo todo sano, empieza
+            # a aplicarlo. Se veia como macrobloques sanos con el color roto.
+            trust = bool(dst.ok) and not bool(info[i].bad[s * 5:(s + 1) * 5].any())
             cache = {}
             for m in range(5):
                 j = int(ss[m])
                 if j < 0:
-                    # no se sustituye, pero hay que dejarlo emitible igual
+                    # No se sustituye, pero hay que dejarlo emitible. Y si el
+                    # segmento de partida NO era valido hay que truncarlo a su
+                    # area aunque el macrobloque estuviera sano: lo que venga
+                    # del desbordamiento puede ser basura mal repartida, y al
+                    # marcar luego todo el segmento como sano el decodificador
+                    # deja de ignorarlo y lo aplica. Se veia como macrobloques
+                    # sanos con el color disparatado.
                     sanitize_mb(dst.mb[m], trust)
                     continue
                 k2 = int(sb[m])
@@ -355,16 +387,37 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                 if kk in px:
                     # el croma se queda el del macrobloque copiado; solo se
                     # sustituye la luma, que es donde se nota el desplazamiento
-                    _encode.encode_mb(dst, m, px[kk])
+                    libre = _budget_for(dst, m)
+                    _encode.encode_mb(dst, m, px[kk], max_bits=libre)
                     interpolated += 1
                 for t in range(3):
                     dst.mb[m].id[t] = int(base_ids[s * 5 + m][t])
-            trimmed += max(0, fit_segment(dst))
+            # no tocar los macrobloques que no hemos sustituido: estan sanos
+            keep = tuple(m for m in range(5) if int(ss[m]) < 0)
+            trimmed += max(0, fit_segment(dst, protect=keep))
             buf, nlost = native.pack(dst, bytes(out[i][off:off + 400]))
             if nlost:
                 check[1] += 1
-            if check is not None and not native.parse(buf).ok:
+            # Red de seguridad: lo que se escribe tiene que volver a leerse
+            # igual que lo que queriamos escribir. Si no, se deja el segmento
+            # como estaba. Mas vale no arreglar un macrobloque que estropear
+            # los cuatro vecinos.
+            back = native.parse(buf)
+            good = bool(back.ok)
+            if good:
+                for mm in range(5):
+                    for jj in range(6):
+                        a, b_ = dst.mb[mm].b[jj], back.mb[mm].b[jj]
+                        if (a.dc != b_.dc or a.cls != b_.cls or a.mode != b_.mode
+                                or a.ntok != b_.ntok):
+                            good = False
+                            break
+                    if not good:
+                        break
+            if not good:
                 check[0] += 1
+                seg_reverted += 1
+                continue
             out[i][off:off + 400] = np.frombuffer(buf, np.uint8)
             seg_repacked += 1
         if progress and i % 50 == 0:
@@ -373,6 +426,7 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
     rep = dict(filled=filled, motion_reject=motion_reject,
                no_source=no_source, no_support=no_support,
                seg_copied=seg_copied, seg_repacked=seg_repacked,
+               seg_reverted=seg_reverted,
                win_used=used_win.tolist(), bridged=bridged,
                rescued=rescued, shifted=shifted, interpolated=interpolated,
                invalid_written=check[0], overflow=check[1], trimmed=trimmed,

@@ -153,7 +153,10 @@ def merge_frame(reads, prof, order=None, prefer=None, hysteresis=0.20):
             base.mb[m].id[0] = int(canvas_ids[s * 5 + m][0])
             base.mb[m].id[1] = int(canvas_ids[s * 5 + m][1])
             base.mb[m].id[2] = int(canvas_ids[s * 5 + m][2])
-        lost += max(0, fit_segment(base))
+        keep = tuple(m for m in range(5)
+                     if qual[best[m]][s * 5 + m] != SRC_NONE
+                     and best[m] == canvas)
+        lost += max(0, fit_segment(base, protect=keep))
         buf, nlost = native.pack(base, bytes(reads[canvas].frame[off:off + 400]))
         out[off:off + 400] = np.frombuffer(buf, np.uint8)
         repacked += 1

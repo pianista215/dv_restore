@@ -118,3 +118,49 @@ def interpolate_block(luma, i, j1, j2, y0, x0, size=16, rng=12, blend=False):
     if blend:
         return (1 - t) * s1 + t * s2, conf
     return (s1 if (i - j1) <= (j2 - i) else s2), conf
+
+
+def feather(block, frame, y0, x0, ok, strength=0.6, decay=6.0):
+    """Suaviza la junta del bloque con lo que tiene alrededor.
+
+    El contenido interpolado es MAS EXACTO que la estimacion de la camara
+    (error mediano 2,35 frente a 14), pero se ve PEOR, porque la de la camara
+    es suave y la nuestra deja costura: al pegar un recorte tomado de otro
+    instante, sus bordes no casan con los vecinos aunque el movimiento este
+    bien compensado. Medido: la junta en bordes de macrobloque sube a 1,216
+    cuando el original esta en 1,030.
+
+    Aqui se mide el salto en cada borde con el vecino y se reparte una
+    correccion que lo cancela en el borde y se desvanece hacia dentro. El
+    contenido del centro no se toca.
+
+    'ok' dice que bordes son de fiar (el vecino no esta roto).
+    """
+    h, w = frame.shape
+    size = block.shape[0]
+    out = block.astype(np.float32).copy()
+    yy = np.arange(size, dtype=np.float32)
+    corr = np.zeros_like(out)
+    weight = np.zeros_like(out)
+    ramp = np.maximum(0.0, 1.0 - yy / decay)
+
+    if ok.get("left") and x0 - 1 >= 0:
+        d = frame[y0:y0 + size, x0 - 1] - out[:, 0]
+        corr += d[:, None] * ramp[None, :]
+        weight += ramp[None, :]
+    if ok.get("right") and x0 + size < w:
+        d = frame[y0:y0 + size, x0 + size] - out[:, -1]
+        corr += d[:, None] * ramp[::-1][None, :]
+        weight += ramp[::-1][None, :]
+    if ok.get("top") and y0 - 1 >= 0:
+        d = frame[y0 - 1, x0:x0 + size] - out[0, :]
+        corr += d[None, :] * ramp[:, None]
+        weight += ramp[:, None]
+    if ok.get("bottom") and y0 + size < h:
+        d = frame[y0 + size, x0:x0 + size] - out[-1, :]
+        corr += d[None, :] * ramp[::-1][:, None]
+        weight += ramp[::-1][:, None]
+
+    m = weight > 0
+    out[m] += strength * corr[m] / weight[m]
+    return out
