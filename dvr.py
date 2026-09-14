@@ -327,6 +327,8 @@ def cmd_conceal(args):
     print(f"  dejados: la zona se mueve  : {rep['motion_reject']:8d}")
     print(f"  dejados: ningun frame vecino lo tiene sano : {rep['no_source']:8d}")
     print(f"  dejados: sin vecinos sanos con que medir   : {rep['no_support']:8d}")
+    print(f"  de los tapados, con el origen desplazado: {rep['shifted']:8d}"
+          f"   (compensando el paneo de la camara)")
     print(f"  de los tapados, rescatados por disparate: {rep['rescued']:8d}"
           f"   (lo que habia era imagen de otro momento)")
     print(f"  de los tapados, por puente entre frames buenos: {rep['bridged']:8d}"

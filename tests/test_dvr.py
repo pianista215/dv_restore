@@ -217,6 +217,31 @@ class TestOutliers(unittest.TestCase):
         self.assertEqual(find_misplaced(bad, [1, 6, 1], PAL), [])
 
 
+class TestMotion(unittest.TestCase):
+    def test_shift_direction(self):
+        """El convenio es ORIGEN = DESTINO + (dr, dc). Si me equivoco de signo,
+        la compensacion empeora en vez de mejorar."""
+        from dvr.conceal import best_shift
+        from dvr.layout import PAL
+
+        class Info:
+            def __init__(self, g):
+                self.grid_dc = g.astype(np.float32)
+                self.grid_ok = np.ones_like(g, bool)
+
+        rng = np.random.default_rng(4)
+        g = rng.integers(0, 200, (PAL.mb_rows, PAL.mb_cols)).astype(np.float32)
+        # src[r, c] = g[r, c + 3]. Lo que en el destino esta en la columna c,
+        # en el origen esta en c - 3, asi que el desplazamiento es (0, -3).
+        src = np.roll(g, -3, axis=1)
+        self.assertEqual(best_shift(Info(g), Info(src), PAL), (0, -3))
+        # src[r, c] = g[r - 2, c]  ->  el origen esta dos filas mas abajo
+        src = np.roll(g, 2, axis=0)
+        self.assertEqual(best_shift(Info(g), Info(src), PAL), (2, 0))
+        # sin movimiento, cero
+        self.assertEqual(best_shift(Info(g), Info(g), PAL), (0, 0))
+
+
 class TestOrder(unittest.TestCase):
     def test_topo_order_with_gaps(self):
         from dvr.match import _topo_order
