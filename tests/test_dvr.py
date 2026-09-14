@@ -289,6 +289,62 @@ class TestPixels(unittest.TestCase):
                            f"solo el {100*(errs<1).mean():.0f}% coincide")
 
 
+class TestEncode(unittest.TestCase):
+    """pixeles -> codificar -> pixeles tiene que devolver lo mismo."""
+
+    def setUp(self):
+        self.path = any_dv()
+        if not self.path:
+            self.skipTest("no hay ningun .dv con el que probar")
+
+    def test_round_trip(self):
+        from dvr import native, pixels, encode
+        n = os.path.getsize(self.path) // PAL.frame_size
+        M = np.memmap(self.path, dtype=np.uint8, mode="r", shape=(n, PAL.frame_size))
+        f = np.array(M[n // 2])
+        rng = np.random.default_rng(1)
+        errs = []
+        for k in rng.choice(PAL.n_video, 150, replace=False):
+            s, m = int(k) // 5, int(k) % 5
+            off = int(PAL.seg[s, 0])
+            seg = native.parse(bytes(f[off:off + 400]))
+            if not seg.ok:
+                continue
+            q = int(seg.mb[m].qno)
+            for j in range(4):
+                b = seg.mb[m].b[j]
+                if b.mode:              # 2-4-8 no soportado
+                    continue
+                toks = [int(b.tok[i]) for i in range(int(b.ntok))]
+                px = pixels.block_pixels(b.dc, b.mode, b.cls, q, toks)
+                d2, c2, t2 = encode.encode_block(px, q, int(b.cls))
+                px2 = pixels.block_pixels(d2, 0, c2, q, t2)
+                errs.append(float(np.abs(px - px2).mean()))
+        self.assertGreater(len(errs), 100)
+        errs = np.array(errs)
+        self.assertLess(float(np.percentile(errs, 90)), 1.5,
+                        f"p90 del error {np.percentile(errs,90):.2f}")
+        self.assertGreater(float((errs < 0.5).mean()), 0.8,
+                           f"solo el {100*(errs<0.5).mean():.0f}% exacto")
+
+    def test_long_runs_are_split(self):
+        """La tabla no cubre (recorrido largo, nivel): hay que partirlo."""
+        from dvr.encode import _tokens_for
+        from dvr.bitstream import VLC_RUN, VLC_LEVEL
+        levels = np.zeros(64, np.int64)
+        levels[40] = 7           # recorrido 39, nivel 7: no existe en la tabla
+        toks = _tokens_for(levels)
+        pos = 0
+        got = {}
+        for t in toks:
+            pos += int(VLC_RUN[t]) + 1
+            if pos >= 64:
+                break
+            if VLC_LEVEL[t]:
+                got[pos] = int(VLC_LEVEL[t])
+        self.assertEqual(got, {40: 7})
+
+
 class TestOrder(unittest.TestCase):
     def test_topo_order_with_gaps(self):
         from dvr.match import _topo_order
