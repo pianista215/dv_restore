@@ -51,8 +51,23 @@ for _c, _end in enumerate(QUANT_AREAS):
 del _i, _c, _end
 
 
+_FT = {}
+
+
 def factor_table(qno, cls, mode):
-    """Factor de desescalado de cada posicion del recorrido."""
+    """Factor de desescalado de cada posicion del recorrido.
+
+    Cacheado: solo hay 16x4x2 combinaciones y se pedia una por bloque y clase,
+    que era una parte notable del coste de codificar.
+    """
+    key = (qno, cls, mode)
+    f = _FT.get(key)
+    if f is None:
+        f = _FT[key] = _factor_table(qno, cls, mode)
+    return f
+
+
+def _factor_table(qno, cls, mode):
     s = qno + int(QUANT_OFFSET[cls])
     s = min(max(s, 0), 21)
     iw = IWEIGHT_248 if mode else IWEIGHT_88

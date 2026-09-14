@@ -57,25 +57,27 @@ def estimate_motion(a, b, y0, x0, size=16, ctx=16, rng=12):
     S = size + 2 * ctx
     if Y0 - rng < 0 or X0 - rng < 0 or Y0 + S + rng > h or X0 + S + rng > w:
         return 0, 0
-    ref = a[Y0:Y0 + S, X0:X0 + S]
+    # Barrido grueso submuestreando de dos en dos (cuatro veces menos datos) y
+    # afinado a paso 1 sobre el mejor, ya con todos los pixeles. Hacerlo de una
+    # vez con sliding_window_view sale PEOR: materializa un array enorme.
+    ref2 = a[Y0:Y0 + S:2, X0:X0 + S:2]
     best = (None, 0, 0)
     for dy in range(-rng, rng + 1, 2):
         for dx in range(-rng, rng + 1, 2):
-            cmp_ = b[Y0 + dy:Y0 + dy + S, X0 + dx:X0 + dx + S]
-            e = float(np.abs(ref - cmp_).mean())
+            e = np.abs(ref2 - b[Y0 + dy:Y0 + dy + S:2, X0 + dx:X0 + dx + S:2]).sum()
             if best[0] is None or e < best[0]:
                 best = (e, dy, dx)
-    # afinar a paso 1 alrededor del mejor. El barrido grueso va de dos en dos,
-    # asi que el afinado tiene que cubrir al menos +-2 para alcanzar los
-    # impares aunque el grueso haya caido en el par de al lado.
+    ref = a[Y0:Y0 + S, X0:X0 + S]
     by, bx = best[1], best[2]
+    best = (None, by, bx)
+    # el grueso va de dos en dos, asi que el afinado cubre +-2 para alcanzar
+    # los impares aunque haya caido en el par de al lado
     for dy in range(by - 2, by + 3):
         for dx in range(bx - 2, bx + 3):
             if abs(dy) > rng or abs(dx) > rng:
                 continue
-            cmp_ = b[Y0 + dy:Y0 + dy + S, X0 + dx:X0 + dx + S]
-            e = float(np.abs(ref - cmp_).mean())
-            if e < best[0]:
+            e = np.abs(ref - b[Y0 + dy:Y0 + dy + S, X0 + dx:X0 + dx + S]).sum()
+            if best[0] is None or e < best[0]:
                 best = (e, dy, dx)
     return best[1], best[2]
 

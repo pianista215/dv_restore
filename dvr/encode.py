@@ -87,10 +87,9 @@ def _tokens_for(levels):
 
 
 def _levels(z, qno, cls):
-    f = factor_table(qno, cls, 0).astype(np.float64)
-    lv = z * (1 << 14) / np.maximum(f, 1)
+    f = factor_table(qno, cls, 0)
     out = np.zeros(64, np.int64)
-    out[1:] = np.round(lv[1:]).astype(np.int64)
+    out[1:] = np.rint(z[1:] * (1 << 14) / f[1:]).astype(np.int64)
     return out
 
 
