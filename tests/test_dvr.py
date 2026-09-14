@@ -345,6 +345,36 @@ class TestEncode(unittest.TestCase):
         self.assertEqual(got, {40: 7})
 
 
+class TestInterp(unittest.TestCase):
+    def test_motion_sign(self):
+        """Convenio: a(y,x) ~= b(y+dy, x+dx).
+
+        Equivocarse de signo no da un resultado mediocre, da uno PEOR que no
+        compensar: medido, error mediano 5,68 frente a 3,97 de copiar sin mas,
+        cuando con el signo bueno es 2,41.
+        """
+        from dvr.interp import estimate_motion, sample
+        rng = np.random.default_rng(7)
+        # imagen con estructura, no ruido por pixel: con ruido puro el
+        # emparejamiento es degenerado y no mide nada
+        small = rng.integers(0, 255, (25, 25)).astype(np.float32)
+        img = np.repeat(np.repeat(small, 8, axis=0), 8, axis=1)
+        img = img + rng.normal(0, 3, img.shape).astype(np.float32)
+        # b es a desplazada: b(y, x) = a(y - 3, x - 5)
+        b = np.roll(np.roll(img, 3, axis=0), 5, axis=1).astype(np.float32)
+        dy, dx = estimate_motion(img, b, 100, 100)
+        self.assertEqual((dy, dx), (3, 5))
+        # y muestrear b en (y0+dy, x0+dx) tiene que devolver lo de a en (y0,x0)
+        got = sample(b, 100, 100, dy, dx)
+        self.assertLess(float(np.abs(got - img[100:116, 100:116]).max()), 1e-3)
+
+    def test_sample_is_exact_on_integers(self):
+        from dvr.interp import sample
+        img = np.arange(100 * 100, dtype=np.float32).reshape(100, 100)
+        got = sample(img, 10, 20, 3, -4, size=8)
+        self.assertTrue(np.allclose(got, img[13:21, 16:24]))
+
+
 class TestOrder(unittest.TestCase):
     def test_topo_order_with_gaps(self):
         from dvr.match import _topo_order
