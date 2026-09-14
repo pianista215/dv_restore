@@ -55,6 +55,34 @@ transcodificador: opera sobre el flujo DV crudo, a nivel de macrobloque.
   rechaza esas uniones: aceptarlas crea ciclos en el grafo de orden y un ciclo
   temprano desordena todo lo que va detrás.
 
+## Cosas que parecían buena idea y NO funcionan
+
+Medidas y descartadas. No las reintentes sin leer esto.
+
+- **Elegir el origen de la copia por la estructura del ECC.** El daño de estas
+  cintas golpea siempre la misma posición dentro del segmento de vídeo, y el
+  barajado convierte eso en una banda de 9 columnas que cruza la pantalla: m=3
+  son las columnas 0-8, m=1 las 9-17, m=0 las 18-26, m=2 las 27-35 y m=4 las
+  36-44. Cuando la posición que falla deriva, la banda nace en el centro y se va
+  a la derecha hasta salirse. Explica perfectamente el artefacto, pero preferir
+  orígenes con esa banda fría **empeora**: error mediano 2,2 -> 3,0 donde cambia
+  la elección, peor en el 52% de los casos. Los orígenes estructuralmente
+  limpios están más lejos en el tiempo y eso cuesta más de lo que gana.
+  Desempatar solo entre candidatos a igual distancia es todavía peor (media 4,6
+  -> 9,3). **La cercanía temporal domina.**
+
+- **Estabilizar el lienzo entre frames consecutivos.** El lienzo saltaba de
+  captura en el 31% de las transiciones y la diferencia media era mayor cuando
+  cambiaba (11,3 frente a 7,5). Parecía causal y no lo era: bajarlo al 8% no
+  movió ni un salto. El lienzo cambia donde hay más daño, y hay más daño donde
+  la imagen se mueve. Se dejó puesto porque mantiene coherentes el subcódigo y
+  el audio, no porque arregle nada.
+
+- **Votar por mayoría entre lecturas sanas que discrepan.** Con ocho pasadas
+  solo discrepan 391 bloques de 792 087 (0,049%), todos con mayoría clara: 0,3
+  bloques por frame. Invisible. La basura que queda es idéntica en las ocho
+  pasadas, o sea que está escrita en la cinta.
+
 ## Pruebas
 
 ```bash
