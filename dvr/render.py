@@ -21,20 +21,32 @@ def decode(frame_bytes, prof, planes="yuv", ec=None):
     n = len(data) // prof.frame_size
     if planes == "rgb":
         pix, depth = "rgb24", 3
-    else:
+    elif planes == "y":
+        # OJO: pedir 'gray' hace que ffmpeg expanda el rango de estudio
+        # (16-235) a completo (0-255). Para comparar con nuestros propios
+        # pixeles hay que pedir el plano Y tal cual, con 'yuv420p'.
         pix, depth = "gray", 1
+    else:
+        pix, depth = "yuv420p", 0
     pre = [] if ec is None else ["-ec", str(ec)]
     p = subprocess.run(
         ["ffmpeg", "-v", "error"] + pre + ["-f", "dv", "-i", "pipe:0",
          "-f", "rawvideo", "-pix_fmt", pix, "pipe:1"],
         input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    need = n * prof.height * prof.width * depth
+    if depth == 0:      # yuv420p: Y entero + dos cromas a la mitad
+        need = n * prof.height * prof.width * 3 // 2
+    else:
+        need = n * prof.height * prof.width * depth
     out = p.stdout
     if len(out) < need:
         raise RuntimeError(
             f"ffmpeg devolvio {len(out)} bytes, esperaba {need}: "
             f"{p.stderr.decode(errors='replace')[:300]}")
     a = np.frombuffer(out[:need], dtype=np.uint8)
+    if depth == 0:
+        fs = prof.height * prof.width * 3 // 2
+        return np.stack([a[i * fs:i * fs + prof.height * prof.width]
+                         .reshape(prof.height, prof.width) for i in range(n)])
     if depth == 1:
         return a.reshape(n, prof.height, prof.width)
     return a.reshape(n, prof.height, prof.width, 3)

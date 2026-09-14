@@ -242,6 +242,53 @@ class TestMotion(unittest.TestCase):
         self.assertEqual(best_shift(Info(g), Info(g), PAL), (0, 0))
 
 
+class TestPixels(unittest.TestCase):
+    """Nuestro decodificador a pixeles tiene que dar LO MISMO que ffmpeg.
+
+    Es la puerta de entrada a cualquier codificacion: si no reproducimos sus
+    pixeles, lo que escribamos saldra mal.
+    """
+
+    def setUp(self):
+        self.path = any_dv()
+        if not self.path:
+            self.skipTest("no hay ningun .dv con el que probar")
+
+    def test_matches_ffmpeg(self):
+        from dvr import native, render, shuffle, pixels
+        try:
+            table = shuffle.load(PAL)
+        except RuntimeError:
+            self.skipTest("falta la tabla de barajado")
+        n = os.path.getsize(self.path) // PAL.frame_size
+        M = np.memmap(self.path, dtype=np.uint8, mode="r", shape=(n, PAL.frame_size))
+        f = np.array(M[n // 2])
+        img = render.decode(f, PAL, "yraw")[0].astype(np.float64)
+        pos = np.asarray(table, np.int64)
+        rng = np.random.default_rng(0)
+        errs = []
+        for k in rng.choice(PAL.n_video, 120, replace=False):
+            s, m = int(k) // 5, int(k) % 5
+            off = int(PAL.seg[s, 0])
+            seg = native.parse(bytes(f[off:off + 400]))
+            if not seg.ok:
+                continue
+            mine = pixels.mb_luma(seg, m)
+            if mine is None:            # 2-4-8, no soportado a proposito
+                continue
+            p = int(pos[k])
+            r, c = p // PAL.mb_cols, p % PAL.mb_cols
+            ref = img[r * 16:(r + 1) * 16, c * 16:(c + 1) * 16]
+            errs.append(np.abs(np.clip(mine, 0, 255) - ref).mean())
+        self.assertGreater(len(errs), 20, "muy pocos macrobloques utilizables")
+        errs = np.array(errs)
+        # solo redondeo: la IDCT de ffmpeg es entera y la nuestra en coma flotante
+        self.assertLess(float(np.median(errs)), 0.6,
+                        f"mediana del error {np.median(errs):.2f}")
+        self.assertGreater(float((errs < 1.0).mean()), 0.9,
+                           f"solo el {100*(errs<1).mean():.0f}% coincide")
+
+
 class TestOrder(unittest.TestCase):
     def test_topo_order_with_gaps(self):
         from dvr.match import _topo_order
