@@ -11,6 +11,7 @@
   dvr.py merge ...                fusiona (ver dvr.py merge -h)
   dvr.py refextract VIDEO --out D extrae un video de referencia (DVD) a luma
   dvr.py refalign BASE.dv --ref D alinea la referencia con la cinta
+  dvr.py stretch SRC.dv --to B.dv  pone SRC en la linea temporal de B
 
 Todas las rutas de salida van a --out (por defecto work/).
 """
@@ -523,6 +524,42 @@ def cmd_runall(args):
     return 0
 
 
+def cmd_stretch(args):
+    """Pone una captura sobre la linea temporal de otra, congelando donde no
+    tiene frames. Es lo que hace falta para comparar el original con el
+    resultado: sin esto van desfasados y no se puede juzgar nada.
+
+    Usa la misma programacion dinamica que la alineacion del video de
+    referencia, asi que no necesita indice: vale aunque la restauracion se haya
+    hecho por ventanas y no haya un indice global guardado.
+    """
+    import numpy as np
+    from dvr.dvfile import Capture
+    from dvr.refvideo import dv_signatures, align
+    src = Capture(args.src)
+    dst = Capture(args.to)
+    print(f"origen  : {src.name}  {src.n} frames")
+    print(f"destino : {dst.name}  {dst.n} frames")
+    ssig, shealth = dv_signatures(src)
+    dsig, dhealth = dv_signatures(dst)
+    # para cada frame del destino, cual del origen. Aqui lo ESPERADO son las
+    # repeticiones (el destino tiene mas frames), asi que quedarse quieto es
+    # barato y saltar es caro: al reves que al alinear un video externo.
+    v, cost, margin = align(ssig, dsig, dhealth, band=args.band,
+                            max_skip=args.max_skip, lam=args.lam, mu=args.mu)
+    d = np.diff(v)
+    froze = int((d == 0).sum())
+    print(f"\n  congelados: {froze} frames ({froze/25:.1f}s) que {src.name} "
+          f"no tiene")
+    print(f"  saltos: {int((d > 1).sum())}")
+    print(f"  coste: mediana {np.median(cost):.4f}  p90 {np.percentile(cost,90):.4f}")
+    with open(args.out, "wb") as fh:
+        for i in range(dst.n):
+            fh.write(src.frame(int(v[i])).tobytes())
+    print(f"\n{dst.n} frames -> {args.out}")
+    return 0
+
+
 def cmd_refextract(args):
     from dvr.refvideo import extract
     store = extract(args.video, args.out)
@@ -765,6 +802,19 @@ def main():
     p.add_argument("--uncovered", type=float, default=0.05,
                    help="coste por encima del cual la referencia no lo tiene")
     p.set_defaults(func=cmd_refalign)
+
+    p = sub.add_parser("stretch",
+                       help="pone una captura en la linea temporal de otra")
+    p.add_argument("src")
+    p.add_argument("--to", required=True, help="fichero que marca la linea temporal")
+    p.add_argument("--out", required=True)
+    p.add_argument("--band", type=int, default=80)
+    p.add_argument("--max-skip", type=int, default=8)
+    p.add_argument("--lam", type=float, default=0.050,
+                   help="penalizacion por saltar (aqui no se espera saltar)")
+    p.add_argument("--mu", type=float, default=0.004,
+                   help="penalizacion por congelar (aqui se espera congelar)")
+    p.set_defaults(func=cmd_stretch)
 
     args = ap.parse_args()
     return args.func(args)
