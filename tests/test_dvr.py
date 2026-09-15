@@ -635,3 +635,50 @@ class TestRefConceal(unittest.TestCase):
             for s in range(0, prof.n_seg, 37):
                 off = int(prof.seg[s, 0])
                 self.assertTrue(native.parse(bytes(f[off:off + 400])).ok)
+
+
+class TestIndexIO(unittest.TestCase):
+    """El indice se guarda y se relee igual.
+
+    Estaba roto: dvr.py importaba save_index/load_index y match.py no las
+    definia, asi que los subcomandos index, merge y preview no arrancaban.
+    runall no se enteraba porque construye el indice en memoria.
+    """
+
+    def test_round_trip(self):
+        import tempfile
+        from dvr.dvfile import Capture
+        from dvr.match import TapeIndex, save_index, load_index
+        p = any_dv()
+        if p is None:
+            self.skipTest("no hay ningun .dv con el que probar")
+        cap = Capture(p)
+        n = min(20, cap.n)
+        clusters = [[(0, f)] for f in range(n)]
+        idx = TapeIndex([cap], clusters, list(range(n)), {"clusters": n})
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+            path = fh.name
+        try:
+            save_index(idx, path)
+            back = load_index(path)
+            self.assertEqual(len(back), len(idx))
+            for k in range(len(idx)):
+                self.assertEqual(back.reads(k), idx.reads(k))
+            self.assertEqual(back.caps[0].n, cap.n)
+        finally:
+            os.unlink(path)
+
+    def test_missing_capture_says_so(self):
+        import json
+        import tempfile
+        from dvr.match import load_index
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as fh:
+            json.dump({"caps": ["/no/existe/nada.dv"], "clusters": [],
+                       "order": [], "stats": {}}, fh)
+            path = fh.name
+        try:
+            with self.assertRaises(FileNotFoundError):
+                load_index(path)
+        finally:
+            os.unlink(path)
