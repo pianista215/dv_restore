@@ -709,7 +709,7 @@ class TestRefClean(unittest.TestCase):
         roto[160:176, 160:176] += rng.normal(0, 3, (16, 16)) + 45
         self.assertGreater(seam(roto, 10, 10, PAL), 3 * limpio)
 
-    def test_disagreement_is_nan_outside_coverage(self):
+    def test_partial_coverage_is_used_not_discarded(self):
         from dvr.refclean import disagreement
         from dvr.layout import PAL
         from dvr import shuffle
@@ -722,18 +722,42 @@ class TestRefClean(unittest.TestCase):
         rng = np.random.default_rng(1)
         dv = rng.normal(128, 20, (PAL.height, PAL.width))
         ref = dv.copy()
-        ref[:16, :] = np.nan            # la fila 0 no la cubre la referencia
-        e, adj = disagreement(dv, ref, PAL, rows, cols,
-                              lambda r, c: 1 <= r < 36 and 1 <= c < 44)
-        self.assertIsNotNone(e)
-        fila0 = [k for k in range(PAL.n_video) if rows[k] == 0]
-        self.assertTrue(np.isnan(e[fila0]).all())
-        dentro = [k for k in range(PAL.n_video)
-                  if 1 <= rows[k] < 36 and 1 <= cols[k] < 44]
+        # el recorte real: 8 columnas por lado y una linea arriba
+        ref[:, :8] = np.nan
+        ref[:, PAL.width - 8:] = np.nan
+        ref[:1, :] = np.nan
+        lo, hi, adj = disagreement(dv, ref, PAL, rows, cols)
+        self.assertIsNotNone(lo)
+        # las columnas del borde estan cubiertas a medias, y eso basta: tirarlas
+        # enteras costaba el 6,5% de la imagen, y justo el borde
+        self.assertEqual(int(np.isfinite(lo).sum()), PAL.n_video)
         # identicos salvo el ajuste de niveles: el desacuerdo tiene que ser ~0
-        self.assertLess(float(np.nanmedian(e[dentro])), 0.5)
+        self.assertLess(float(np.nanmedian(lo)), 0.5)
+        # y un macrobloque con menos cobertura que el minimo si se descarta
+        ref2 = dv.copy()
+        ref2[:, :16 * 3] = np.nan
+        lo2, _, _ = disagreement(dv, ref2, PAL, rows, cols)
+        col0 = [k for k in range(PAL.n_video) if cols[k] == 0]
+        self.assertTrue(np.isnan(lo2[col0]).all())
 
-    def test_untrustworthy_frame_is_left_alone(self):
+    def test_neighbourhood_decides_trust_not_the_frame_itself(self):
+        """Un frame roto en medio de un tramo bien alineado SI esta alineado.
+
+        Medido: un frame destrozado pero cubierto da coste de alineacion 0,43
+        y uno sin cobertura 0,38 -- indistinguibles mirando el frame solo. El
+        vecindario si los separa.
+        """
+        from dvr.refvideo import frame_trust
+        cost = np.full(120, 0.002)
+        cost[30] = 0.45                 # frame destrozado, pero bien alineado
+        cost[60:100] = 0.40             # tramo entero sin cobertura
+        t = frame_trust(cost, win=4, q=25)
+        self.assertLess(t[30], 0.05, "el frame roto aislado deberia ser fiable")
+        self.assertGreater(t[80], 0.2, "el tramo sin cobertura no deberia serlo")
+        # y en los bordes del tramo la decision es gradual, no un escalon
+        self.assertLess(t[30], t[80])
+
+    def test_untrusted_frame_is_left_alone(self):
         from dvr import refclean
         from dvr.dvfile import Capture
         p = any_dv()
@@ -752,12 +776,13 @@ class TestRefClean(unittest.TestCase):
 
             @staticmethod
             def frame_dv(v, fm=None):
-                # referencia que no tiene nada que ver: debe rechazarse entera
                 rng = np.random.default_rng(v)
                 return rng.normal(128, 50, (cap.prof.height, cap.prof.width))
 
-        out, rep = refclean.clean_sequence(frames, cap.prof, _Store(),
-                                           np.arange(len(frames)))
+        # sin cobertura en ningun frame: no se toca nada
+        out, rep = refclean.clean_sequence(
+            frames, cap.prof, _Store(), np.arange(len(frames)),
+            trust=np.full(len(frames), 0.9))
         self.assertEqual(rep["written"], 0)
         self.assertEqual(rep["frames_skipped"], len(frames))
         for x, y in zip(frames, out):

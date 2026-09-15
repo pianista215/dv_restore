@@ -15,11 +15,14 @@ referencia lo es: es una observacion independiente de la misma cinta.
 
 El criterio tiene dos niveles, y el segundo es el que protege la cinta:
 
-  1. Por frame: si la referencia no esta bien alineada aqui (o sencillamente
-     no tiene este material), su desacuerdo MEDIANO con el frame entero se
-     dispara. Medido: 4,3 y 3,8 donde esta bien, 25,9 donde no hay cobertura.
-     Por encima de `frame_trust` no se toca nada del frame. Esto descarta los
-     tramos sin cobertura solo, sin mas umbrales.
+  1. Por frame: hay que saber si la referencia esta bien puesta AQUI, y eso no
+     se le puede preguntar al propio frame. Un frame muy danado discrepa de la
+     referencia y tiene coste de alineacion alto, pero no porque la referencia
+     falle: porque lo nuestro esta roto. Medido, las dos causas se confunden
+     del todo (frame destrozado pero cubierto: coste 0,43; frame sin
+     cobertura: 0,38). Quien las separa es el VECINDARIO, porque un frame roto
+     en medio de un tramo bien alineado sigue estando bien alineado. Ver
+     refvideo.frame_trust().
 
   2. Por macrobloque, dentro de un frame fiable: se sustituye el que discrepa
      mucho Y ADEMAS no empalma con sus vecinos. Las dos condiciones hacen
@@ -31,7 +34,10 @@ El criterio tiene dos niveles, y el segundo es el que protege la cinta:
      salto con el vecino (6,0 frente a 2,9). Un bloque basura no pega con lo
      que tiene al lado; uno texturado si.
 
-Solo se toca la luma. El croma se queda el que habia, igual que en conceal.
+Se toca la luma y, si se da el croma de la referencia, tambien el color. El
+croma importa mas de lo que parece: con la luma ya reparada y lisa, los bloques
+de croma rotos se ven como manchas naranjas y azules encima. Y el croma del DVD
+es bueno -- casa con el croma SANO del DV con error mediano 2,4 a 3,6, medido.
 """
 
 import numpy as np
@@ -42,27 +48,56 @@ from .conceal import _budget_for
 from .fixup import fit_segment
 
 
-def disagreement(luma_dv, luma_ref, prof, rows, cols, covers):
-    """RMSE por macrobloque entre el DV y la referencia, ya nivelada.
+MIN_COVER = 0.4          # fraccion minima del macrobloque que la referencia cubre
 
-    Devuelve (e, ref_ajustada). e vale NaN donde la referencia no cubre.
+
+def disagreement(luma_dv, luma_ref, prof, rows, cols, covers=None):
+    """Desacuerdo por macrobloque entre el DV y la referencia, ya nivelada.
+
+    Devuelve (e_baja, e_alta, ref_ajustada), ambas NaN donde no hay cobertura
+    suficiente.
+
+    Se separan DOS desacuerdos porque significan cosas distintas:
+
+      e_baja  sobre medias de 4x4, o sea la estructura. Un bloque correcto pero
+              mas nitido que la referencia coincide aqui; uno roto, no. Es el
+              detector: medido sobre un frame limpio, su p99 es 3,9 (el del
+              desacuerdo completo, 5,0), asi que discrimina con el umbral mas
+              bajo y menos falsos positivos.
+
+      e_alta  lo que queda, que es basicamente la diferencia de nitidez. Sirve
+              para NO tocar un bloque que solo discrepa por ser mas fino.
+
+    La cobertura se admite PARCIAL. La referencia es de 704 columnas y el DV de
+    720, asi que la columna 0 y la 44 tienen la mitad de sus pixeles fuera y la
+    fila 0 una linea. Exigir cobertura completa tiraba el 6,5% de la imagen, y
+    justo el borde, que se ve. Donde falta se conserva lo nuestro.
     """
     m = np.isfinite(luma_ref)
     if m.sum() < 1000:
-        return None, None
+        return None, None, None
     g = np.polyfit(luma_ref[m], luma_dv[m], 1)
     ref = np.polyval(g, luma_ref)
-    e = np.full(prof.n_video, np.nan, np.float64)
+    lo = np.full(prof.n_video, np.nan, np.float64)
+    hi = np.full(prof.n_video, np.nan, np.float64)
     for k in range(prof.n_video):
         r, c = int(rows[k]), int(cols[k])
-        if not covers(r, c):
-            continue
+        if covers is not None and not covers(r, c):
+            pass
         q = ref[16 * r:16 * r + 16, 16 * c:16 * c + 16]
-        if not np.isfinite(q).all():
+        ok = np.isfinite(q)
+        if q.shape != (16, 16) or ok.mean() < MIN_COVER:
             continue
         p = luma_dv[16 * r:16 * r + 16, 16 * c:16 * c + 16]
-        e[k] = np.sqrt(np.mean((p - q) ** 2))
-    return e, ref
+        d = np.where(ok, p - q, 0.0)
+        n = ok.sum()
+        # estructura: medias de 4x4 sobre lo cubierto
+        w = ok.reshape(4, 4, 4, 4).sum(axis=(1, 3))
+        dl = d.reshape(4, 4, 4, 4).sum(axis=(1, 3))
+        good = w > 0
+        lo[k] = np.sqrt(np.mean((dl[good] / w[good]) ** 2))
+        hi[k] = np.sqrt((d ** 2).sum() / n)
+    return lo, hi, ref
 
 
 def seam(luma, r, c, prof):
@@ -88,13 +123,17 @@ def seam(luma, r, c, prof):
     return max(vals) if vals else 0.0
 
 
-def clean_sequence(frames, prof, store, v_of_i, table=None, thr=15.0,
-                   frame_trust=8.0, min_seam=1.6, fm=None, progress=None):
+def clean_sequence(frames, prof, store, v_of_i, trust=None, table=None,
+                   thr=4.0, trust_thr=0.25, min_seam=1.6, detail_floor=6.0,
+                   fm=None, chroma=None, progress=None):
     """Sustituye la luma de los macrobloques falsamente sanos.
 
     frames    lista de frames (se copian, no se tocan los originales)
     store     RefStore con el video de referencia ya extraido
     v_of_i    frame de la referencia que corresponde a cada frame de la lista
+    trust     fiabilidad de la alineacion por frame (refvideo.frame_trust);
+              si falta, se trata todo
+    chroma    ChromaStore opcional; si se da, se sustituye tambien el color
 
     Devuelve (salida, informe).
     """
@@ -104,35 +143,47 @@ def clean_sequence(frames, prof, store, v_of_i, table=None, thr=15.0,
     cols = np.asarray(table) % prof.mb_cols
     out = [np.array(f) for f in frames]
     rep = dict(frames_skipped=0, flagged=0, rejected_seam=0, written=0,
-               seg_reverted=0, invalid_written=0, medians=[])
+               chroma_written=0, partial=0, seg_reverted=0, invalid_written=0,
+               medians=[])
 
     for i in range(len(frames)):
         if progress and i % 25 == 0:
             progress(i, len(frames))
         v = int(v_of_i[i])
-        if v < 0 or v >= store.n:
+        if v < 0 or v >= store.n or (trust is not None and trust[i] >= trust_thr):
             rep["frames_skipped"] += 1
             continue
         dv = render.decode(out[i], prof, "yraw")[0].astype(np.float64)
-        e, ref = disagreement(dv, store.frame_dv(v, fm), prof, rows, cols,
-                              store.covers)
-        if e is None:
+        elo, ehi, ref = disagreement(dv, store.frame_dv(v, fm), prof, rows, cols)
+        cro = (chroma.planes_dv(v, prof.width, prof.height)
+               if chroma is not None else None)
+        if elo is None:
             rep["frames_skipped"] += 1
             continue
-        med = float(np.nanmedian(e))
-        rep["medians"].append(med)
-        if not np.isfinite(med) or med > frame_trust:
-            rep["frames_skipped"] += 1
-            continue
+        rep["medians"].append(float(np.nanmedian(elo)))
 
-        cand = np.nonzero(np.nan_to_num(e) > thr)[0]
+        cand = np.nonzero(np.nan_to_num(elo) > thr)[0]
         if not len(cand):
             continue
         rep["flagged"] += len(cand)
+        # La costura protege a los bloques TEXTURADOS: uno muy texturado
+        # discrepa de una copia de DVD solo por serlo, pero sigue pegando con
+        # sus vecinos. Uno liso que discrepa no tiene esa excusa, y ademas en
+        # un frame donde esta roto todo los vecinos tampoco pegan, asi que
+        # exigir costura ahi rechazaria justo lo que hay que arreglar.
         keep = []
         for k in cand:
             k = int(k)
-            if seam(dv, int(rows[k]), int(cols[k]), prof) >= min_seam:
+            r, c = int(rows[k]), int(cols[k])
+            p = dv[16 * r:16 * r + 16, 16 * c:16 * c + 16]
+            det = (np.abs(np.diff(p, axis=0)).mean()
+                   + np.abs(np.diff(p, axis=1)).mean())
+            # solo se perdona al bloque que discrepa en ALTA frecuencia (es
+            # mas nitido que la referencia) y ademas empalma con sus vecinos.
+            # Si la estructura ya discrepa, esta roto por texturado que sea.
+            solo_nitidez = elo[k] < 0.6 * ehi[k]
+            if (det <= detail_floor or not solo_nitidez
+                    or seam(dv, r, c, prof) >= min_seam):
                 keep.append(k)
             else:
                 rep["rejected_seam"] += 1
@@ -150,9 +201,23 @@ def clean_sequence(frames, prof, store, v_of_i, table=None, thr=15.0,
                 continue
             for m in ms:
                 r, c = int(rows[s * 5 + m]), int(cols[s * 5 + m])
-                _encode.encode_mb(seg, m, ref[16*r:16*r+16, 16*c:16*c+16],
-                                  max_bits=_budget_for(seg, m))
+                cc = None
+                if cro is not None:
+                    q = cro[:, 8*r:8*r+8, 8*c:8*c+8]
+                    if np.isfinite(q).all():
+                        cc = q
+                # donde la referencia no llega se conserva lo nuestro
+                patch = ref[16*r:16*r+16, 16*c:16*c+16]
+                if not np.isfinite(patch).all():
+                    patch = np.where(np.isfinite(patch), patch,
+                                     dv[16*r:16*r+16, 16*c:16*c+16])
+                    rep["partial"] += 1
+                _encode.encode_mb(seg, m, patch,
+                                  max_bits=_budget_for(seg, m, cc is not None),
+                                  chroma=cc)
                 seg.mb[m].sta = 0
+                if cc is not None:
+                    rep["chroma_written"] += 1
             fit_segment(seg, protect=tuple(x for x in range(5) if x not in ms))
             buf, _ = native.pack(seg, src)
             back = native.parse(buf)

@@ -155,7 +155,7 @@ class PairMotion:
         return _win_sum(self.Id, r0, r1, c0, c1) / n, int(n)
 
 
-def _budget_for(seg, m):
+def _budget_for(seg, m, with_chroma=False):
     """Bits que le quedan a un macrobloque sin quitarselos a los demas."""
     from .bitstream import VLC_LEN, HDR_BITS
     used = 0
@@ -166,11 +166,12 @@ def _budget_for(seg, m):
             b = seg.mb[mm].b[j]
             used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
                                        for i in range(int(b.ntok))))
-    # los dos bloques de croma del propio macrobloque no se tocan
-    for j in (4, 5):
-        b = seg.mb[m].b[j]
-        used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
-                                   for i in range(int(b.ntok))))
+    if not with_chroma:
+        # los dos bloques de croma del propio macrobloque no se tocan
+        for j in (4, 5):
+            b = seg.mb[m].b[j]
+            used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
+                                       for i in range(int(b.ntok))))
     return max(0, SEG_CAPACITY - used)
 
 

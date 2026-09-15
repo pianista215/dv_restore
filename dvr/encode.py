@@ -160,11 +160,15 @@ def _put_block(b, dc, c, toks):
     b.done = 1
 
 
-def encode_mb(seg, m, luma, qno=None, cls=None, max_bits=None):
+def encode_mb(seg, m, luma, qno=None, cls=None, max_bits=None, chroma=None):
     """Mete un 16x16 de luma en el macrobloque m de un segmento ya parseado.
 
-    Solo toca los cuatro bloques de luma; el croma se deja como estaba, que es
-    lo correcto cuando el macrobloque de origen ya trae su croma.
+    Por defecto solo toca los cuatro bloques de luma y el croma se deja como
+    estaba, que es lo correcto cuando el macrobloque de origen ya trae su
+    croma. Con 'chroma' = (Cr, Cb) de 8x8 se escribe tambien el color: hace
+    falta cuando lo que hay es basura, porque entonces no hay croma bueno que
+    conservar. Medido, el croma roto se ve como bloques naranjas y azules
+    sobre una luma ya reparada y lisa.
 
     Si se da 'max_bits', el bloque se abarata (clases mas gruesas) hasta caber
     en ese presupuesto. Hace falta: si el macrobloque reconstruido ocupa mas
@@ -183,16 +187,24 @@ def encode_mb(seg, m, luma, qno=None, cls=None, max_bits=None):
     # = menos bits), asi que hay que recorrerla en orden y quedarse con la
     # PRIMERA que quepa, no seguir hasta el final: los ultimos pasos son mas
     # caros y comprometerse con ellos era peor que no hacer nada.
-    orders = [_class_order(qno, base[j]) for j in range(4)]
+    nblk = 6 if chroma is not None else 4
+    if chroma is not None:
+        base += [int(b.cls) if cls is None else cls for b in
+                 (seg.mb[m].b[j] for j in (4, 5))]
+    orders = [_class_order(qno, base[j]) for j in range(nblk)]
     steps = max(len(o) for o in orders)
     last = None
     for step in range(steps):
         out = []
         bits = 0
-        for j in range(4):
+        for j in range(nblk):
             c = orders[j][min(step, len(orders[j]) - 1)]
-            r, cc = QUAD[j]
-            dc, c, toks = encode_block(luma[r:r + 8, cc:cc + 8], qno, c)
+            if j < 4:
+                r, cc = QUAD[j]
+                px = luma[r:r + 8, cc:cc + 8]
+            else:
+                px = chroma[j - 4]
+            dc, c, toks = encode_block(px, qno, c)
             out.append((dc, c, toks))
             bits += HDR_BITS + int(sum(int(VLC_LEN[t]) for t in toks))
         if last is None or bits < last[0]:
@@ -201,7 +213,7 @@ def encode_mb(seg, m, luma, qno=None, cls=None, max_bits=None):
             last = (bits, out)
             break
     bits, out = last
-    for j in range(4):
+    for j in range(nblk):
         _put_block(seg.mb[m].b[j], *out[j])
     seg.mb[m].qno = qno
     return bits

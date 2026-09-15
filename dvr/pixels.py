@@ -123,6 +123,23 @@ def block_pixels(dc, mode, cls, qno, tokens):
 QUAD = ((0, 0), (0, 8), (8, 0), (8, 8))    # Y0 Y1 Y2 Y3 dentro del 16x16
 
 
+def mb_chroma(seg, m):
+    """Los dos 8x8 de croma de un macrobloque (Cr, Cb). None si van en 2-4-8.
+
+    En PAL el DV es 4:2:0: un solo bloque de 8x8 por componente cubre los
+    16x16 de luma del macrobloque.
+    """
+    out = []
+    for j in (4, 5):
+        b = seg.mb[m].b[j]
+        px = block_pixels(b.dc, b.mode, b.cls, seg.mb[m].qno,
+                          [int(b.tok[i]) for i in range(int(b.ntok))])
+        if px is None:
+            return None
+        out.append(px)
+    return np.stack(out)
+
+
 def mb_luma(seg, m):
     """Los 16x16 de luma de un macrobloque. None si algun bloque va en 2-4-8."""
     out = np.zeros((16, 16), np.float64)

@@ -565,6 +565,37 @@ class RefPatches:
         return np.inf if den < 256 else float(np.sqrt(num / den))
 
 
+def frame_trust(cost, win=4, q=25):
+    """Fiabilidad de la alineacion de cada frame, mirando a los VECINOS.
+
+    No se puede preguntarle al propio frame. Un frame muy danado discrepa del
+    video de referencia y tiene coste de alineacion alto, pero no porque la
+    referencia este mal puesta: porque lo nuestro esta roto. Medido, las dos
+    causas se confunden por completo: un frame destrozado pero bien cubierto da
+    coste 0,43 y uno sin cobertura 0,38.
+
+    Lo que si las distingue es el vecindario. Un frame roto en medio de un
+    tramo bien alineado ESTA bien alineado; donde no hay cobertura, no lo esta
+    ninguno de los de alrededor. Medido sobre el primer minuto, este valor sale
+    bimodal con hueco: 0,0005 a 0,13 donde hay cobertura, 0,36 a 0,58 donde no
+    (p90 de los cubiertos 0,021 frente a p10 de los descubiertos 0,346).
+
+    El tamano de ventana fija la racha mas corta que se detecta: hace falta que
+    mas de la mitad del vecindario este sin cobertura, o sea del orden de 2*win
+    frames seguidos. Con win=4 se cazan rachas de 7 en adelante; las de uno o
+    dos frames se tratan, que es lo que se quiere, porque un frame aislado con
+    coste alto es un frame ROTO, no uno sin cobertura.
+    """
+    cost = np.asarray(cost, np.float64)
+    n = len(cost)
+    out = np.empty(n)
+    for i in range(n):
+        lo, hi = max(0, i - win), min(n, i + win + 1)
+        vec = np.concatenate([cost[lo:i], cost[i + 1:hi]])
+        out[i] = np.percentile(vec, q) if len(vec) else cost[i]
+    return out
+
+
 class RefPlan:
     """El mapa global de alineacion, listo para repartir por ventanas.
 
@@ -618,3 +649,85 @@ class RefPlan:
             v_of_k = v_of_k[keep]
             cov = cov[keep]
         return RefPatches(self.store, v_of_k, prof, table, covered=cov)
+
+
+def extract_chroma(vob_path, out_dir, verbose=True):
+    """Segunda pasada, solo para el croma.
+
+    Va aparte de extract() porque la luma sola ya sirve para alinear y para
+    reparar la mayor parte, y el croma dobla el espacio. Deja
+    <out_dir>/refvideo/chroma.raw con los planos U y V a 352x288 por frame.
+    """
+    d = os.path.join(out_dir, "refvideo")
+    meta_p = os.path.join(d, "meta.json")
+    raw_p = os.path.join(d, "chroma.raw")
+    meta = json.load(open(meta_p))
+    n = int(meta["n"])
+    cw, ch = REF_W // 2, REF_H // 2
+    fs = cw * ch * 2
+    if os.path.exists(raw_p) and os.path.getsize(raw_p) == n * fs:
+        if verbose:
+            print(f"ya extraido el croma: {n} frames")
+        return raw_p
+    if verbose:
+        print(f"extrayendo croma de {n} frames -> {raw_p} ({n*fs/1e9:.1f} GB)")
+    ysz = REF_W * REF_H
+    p = subprocess.Popen(
+        ["ffmpeg", "-v", "quiet", "-i", vob_path, "-map", "0:v:0", "-vsync", "0",
+         "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1 << 22)
+    part = raw_p + ".part"
+    got = 0
+    with open(part, "wb") as fh:
+        while got < n:
+            buf = p.stdout.read(ysz + fs)
+            if len(buf) < ysz + fs:
+                break
+            fh.write(buf[ysz:])
+            got += 1
+            if verbose and got % 4000 == 0:
+                print(f"  {got}/{n}...")
+    p.stdout.close()
+    p.wait()
+    os.replace(part, raw_p)
+    if verbose:
+        print(f"listo: {got} frames")
+    return raw_p
+
+
+class ChromaStore:
+    """Los planos de croma de la referencia, en la geometria del DV.
+
+    El DV PAL y el MPEG-2 del DVD son los dos 4:2:0, asi que el croma va a la
+    mitad en los dos ejes: 360x288 el DV, 352x288 la referencia. El recorte
+    horizontal de 8 columnas de luma son 4 de croma, exacto. El vertical NO:
+    una linea de luma es MEDIA linea de croma, asi que hay que remuestrear
+    verticalmente. Es el unico sitio de todo esto donde no basta con recortar.
+    """
+
+    def __init__(self, out_dir, n):
+        p = os.path.join(out_dir, "refvideo", "chroma.raw")
+        self.cw, self.ch = REF_W // 2, REF_H // 2
+        self.n = n
+        self.data = np.memmap(p, dtype=np.uint8, mode="r",
+                              shape=(n, 2, self.ch, self.cw))
+
+    def planes_dv(self, v, dv_w, dv_h):
+        """(2, dv_h//2, dv_w//2) float32 en ORDEN DV: (Cr, Cb). NaN sin cobertura.
+
+        Se devuelve ya intercambiado porque ffmpeg entrega yuv420p como
+        (Y, U=Cb, V=Cr) y el DV guarda los bloques 4 y 5 como (Cr, Cb).
+        Verificado contra el decodificador, no contra la documentacion: el
+        bloque 4 casa con el plano V con error medio 0,25 y con el U con 10,0.
+        La escala es directa, sin desplazamientos ni factores.
+        """
+        cw, ch = dv_w // 2, dv_h // 2
+        out = np.full((2, ch, cw), np.nan, np.float32)
+        src = self.data[v].astype(np.float32)
+        # fila cy del DV <- entre las filas cy-1 y cy de la referencia
+        a = src[:, 0:self.ch - 1, :]
+        b = src[:, 1:self.ch, :]
+        mid = 0.5 * (a + b)
+        x0 = REF_DX // 2
+        out[:, 1:self.ch, x0:x0 + self.cw] = mid
+        return out[::-1]        # (U, V) -> (Cr, Cb)
