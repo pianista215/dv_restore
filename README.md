@@ -100,6 +100,50 @@ through the middle: a single window with every donor fits in neither memory nor
 time. Each window leaves its stretch in `<out>/cores/`, so finished work is not
 repeated. `--budget SECONDS` stops cleanly so the run can be chopped up.
 
+### Optional: a DVD of the same tape as a reference
+
+If the tape was recorded to DVD years ago, back when it still read well, that
+recording is the only source of genuinely **new** information left: everything
+else is synthesis from reads that are already degraded. It never replaces real
+tape data, only macroblocks that have none in any pass.
+
+```bash
+# one sequential decode of the whole video to raw luma (~600 MB per minute)
+python3 dvr.py refextract DVD.VOB --out /path/with/room/work
+
+# align it to the tape, once, and cache the map
+python3 dvr.py refalign BAD.dv --ref /path/with/room/work
+
+# then just add --ref to the normal run
+python3 dvr.py runall BAD.dv OTHERS*.dv --ref /path/with/room/work \
+        --out /path/with/room/work --final /path/with/room/restored.dv
+```
+
+`refalign` reports how much of the tape the recording actually covers, which is
+the number that decides whether any of this is worth it. On the disc this was
+built for: 66.8% covered cleanly, 6.2% doubtful, 27% not covered at all.
+
+What makes the two sources worth combining is that they fail differently. A
+DVD transfer has roughly constant quality whatever the picture is doing; our
+temporal copy is better than it on still content and collapses on movement.
+Measured against ground truth, per macroblock, after the full write round-trip:
+
+| conceal's motion score | reference | copy from a neighbour | reference wins |
+|---|---|---|---|
+| 0-2 | 2.75 | 2.68 | 54% |
+| 2-5 | 3.01 | 3.78 | 69% |
+| 5-10 | 3.07 | 4.86 | 81% |
+| 10-20 | 3.37 | 7.46 | 87% |
+| 20-40 | 3.53 | 10.85 | 91% |
+
+The reference is only consulted above a score of 2, and every patch has to pass
+a local trust gate: its disagreement with the **healthy** macroblocks around it,
+in the same frame. A DVD recorded over an analog connection carries lines and
+dirt of its own, and where it does, it disagrees with the tape beside it and is
+rejected there and then. Taking the reference unconditionally is worse than not
+using it at all (median error 4.61 against 3.65); with the gate it is 3.12,
+where the best possible choice every time would be 2.96.
+
 ### For iterating and debugging
 
 ```bash
