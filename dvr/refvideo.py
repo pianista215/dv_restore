@@ -425,3 +425,196 @@ def align(sig_ref, sig_dv, health, band=60, max_skip=24, lam=0.010, mu=0.060,
             if j < 0:
                 raise RuntimeError(f"camino roto en el frame {f}")
     return v_of_f, cost_of_f, margin
+
+
+# --------------------------------------------------------------------------
+# Parches: de un frame de la referencia a la luma de un macrobloque
+# --------------------------------------------------------------------------
+
+def photometric(dv, ref, ok=None, trim=0.10):
+    """Ajusta  dv ~= ganancia*ref + offset  sobre las celdas sanas.
+
+    Robusto: descarta el 'trim' de residuos mas extremos y reajusta. Las
+    celdas rotas del DV llevan la estimacion de la camara, que puede estar muy
+    lejos, y un ajuste por minimos cuadrados crudo se iria detras de ellas.
+    """
+    m = np.isfinite(ref) & np.isfinite(dv)
+    if ok is not None:
+        m &= ok
+    x, y = ref[m], dv[m]
+    if x.size < 400:
+        return None
+    g = np.polyfit(x, y, 1)
+    res = np.abs(np.polyval(g, x) - y)
+    keep = res <= np.quantile(res, 1.0 - trim)
+    if keep.sum() >= 400:
+        g = np.polyfit(x[keep], y[keep], 1)
+    return float(g[0]), float(g[1])
+
+
+class RefPatches:
+    """Lo que ve la ocultacion: ref(i, k) -> 16x16 de luma, o None.
+
+    No sabe de VOB ni de ffmpeg. Se le da el mapa de frames ya resuelto y una
+    forma de conseguir la luma del DV, y devuelve parches ya puestos en la
+    geometria y los niveles del DV.
+    """
+
+    GAIN_LO, GAIN_HI = 0.80, 1.20
+    OFF_LO, OFF_HI = -30.0, 30.0
+
+    def __init__(self, store, v_of_i, prof, table, luma=None, ok_of=None,
+                 covered=None, fm=None, limit=8):
+        self.store = store
+        self.v = np.asarray(v_of_i, np.int64)
+        self.prof = prof
+        self.luma = luma                       # luma(i) -> (h, w) float, rango DV
+        self.ok_of = ok_of                     # ok_of(i) -> (mb_rows, mb_cols) bool
+        self.covered = covered
+        self.fm = fm or store.fields
+        self.rows = np.asarray(table) // prof.mb_cols
+        self.cols = np.asarray(table) % prof.mb_cols
+        self._cache = {}
+        self._limit = limit
+        self.fits = {}
+
+    def bind(self, luma, ok_of):
+        """La ocultacion presta su cache de luma y su mapa de sanos.
+
+        Asi no se decodifican dos veces los mismos frames, que es el coste
+        dominante de todo esto.
+        """
+        self.luma = luma
+        self.ok_of = ok_of
+        self._cache.clear()
+
+    def frame(self, i):
+        """El frame de referencia de i, en geometria y niveles del DV."""
+        if i in self._cache:
+            return self._cache[i]
+        v = int(self.v[i])
+        if v < 0 or v >= self.store.n or (
+                self.covered is not None and not self.covered[i]):
+            img = None
+        else:
+            img = self.store.frame_dv(v, self.fm)
+            dv = self.luma(i)
+            ok = None
+            if self.ok_of is not None:
+                ok = np.repeat(np.repeat(self.ok_of(i), 16, 0), 16, 1)
+            fit = photometric(dv, img, ok)
+            if fit is None or not (self.GAIN_LO <= fit[0] <= self.GAIN_HI
+                                   and self.OFF_LO <= fit[1] <= self.OFF_HI):
+                img = None
+            else:
+                img = img * fit[0] + fit[1]
+                self.fits[i] = fit
+        if len(self._cache) >= self._limit:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[i] = img
+        return img
+
+    def __call__(self, i, k):
+        img = self.frame(i)
+        if img is None:
+            return None
+        r, c = int(self.rows[k]), int(self.cols[k])
+        if not self.store.covers(r, c):
+            return None
+        p = img[16 * r:16 * r + 16, 16 * c:16 * c + 16]
+        return None if not np.isfinite(p).all() else p
+
+    WINDOWS = (1, 2, 4, 8)
+    MIN_PIX = 4 * 256
+
+    def local_rmse(self, i, k, ok_grid):
+        """Desacuerdo con el DV SANO que rodea al macrobloque.
+
+        Es la puerta de confianza. Donde la referencia trae rayas de la
+        conexion analogica, o esta desalineada, o sencillamente no tiene este
+        material, discrepa de la cinta sana de alrededor y se ve aqui, por
+        macrobloque y usando solo dato real.
+
+        La ventana crece por escalones por la misma razon que la de la puerta
+        de movimiento: el dano viene en manchas, y con radio 1 la mitad de los
+        macrobloques rotos no tienen NI UN vecino sano con el que medir
+        (medido: 49% en el tramo mas danado). Sin escalonado, la puerta no
+        rechaza: sencillamente no opina, y se traga o descarta a ciegas.
+        """
+        img = self.frame(i)
+        if img is None:
+            return np.inf
+        dv = self.luma(i)
+        r, c = int(self.rows[k]), int(self.cols[k])
+        for win in self.WINDOWS:
+            num = den = 0.0
+            for rr in range(r - win, r + win + 1):
+                for cc in range(c - win, c + win + 1):
+                    if (rr == r and cc == c) or not self.store.covers(rr, cc):
+                        continue
+                    if not ok_grid[rr, cc]:
+                        continue
+                    a = dv[16 * rr:16 * rr + 16, 16 * cc:16 * cc + 16]
+                    b = img[16 * rr:16 * rr + 16, 16 * cc:16 * cc + 16]
+                    if not np.isfinite(b).all():
+                        continue
+                    num += float(((a - b) ** 2).sum())
+                    den += a.size
+            if den >= self.MIN_PIX:
+                return float(np.sqrt(num / den))
+        return np.inf if den < 256 else float(np.sqrt(num / den))
+
+
+class RefPlan:
+    """El mapa global de alineacion, listo para repartir por ventanas.
+
+    Se calcula una vez con `refalign` sobre la captura base y se guarda; aqui
+    solo se lee y se traduce a la escala de cada ventana.
+    """
+
+    def __init__(self, work_dir, align_path=None):
+        self.store = RefStore(work_dir)
+        p = align_path or os.path.join(work_dir, "refvideo", "align.json")
+        d = json.load(open(p))
+        self.map = np.array(d["map"], np.int64)
+        self.covered = np.array(d["covered"], bool)
+        self.base_n = int(d["base"]["n"])
+        self.base_name = d["base"]["name"]
+
+    def for_window(self, idx, base_ci, lo, prof, table, drop=()):
+        """RefPatches para una ventana ya indexada.
+
+        idx        indice de frames de cinta de la ventana
+        base_ci    cual de las capturas del indice es el recorte de la base
+        lo         frame de la base al que corresponde el frame 0 del recorte
+        drop       posiciones de cinta descartadas por estar fuera de sitio
+
+        Los frames de cinta que solo tienen lecturas de donantes no tienen
+        numero de base propio; se rellenan interpolando entre los que si lo
+        tienen, que es exacto mientras la referencia tenga los frames de en
+        medio (los dos van a 25 fps). Donde no los tenga, lo caza la puerta de
+        confianza, que mira macrobloque a macrobloque.
+        """
+        ks, vs, cs = [], [], []
+        for k in range(len(idx)):
+            mine = [f for c, f in idx.reads(k) if c == base_ci]
+            if not mine:
+                continue
+            g = lo + int(mine[0])
+            if 0 <= g < len(self.map):
+                ks.append(k)
+                vs.append(int(self.map[g]))
+                cs.append(bool(self.covered[g]))
+        if len(ks) < 2:
+            return None
+        all_k = np.arange(len(idx))
+        v_of_k = np.rint(np.interp(all_k, ks, vs)).astype(np.int64)
+        # cobertura: solo donde la hay a los dos lados, que es lo prudente
+        cov = np.interp(all_k, ks, np.array(cs, float)) >= 0.999
+
+        drop = set(int(x) for x in drop)
+        if drop:
+            keep = [k for k in range(len(idx)) if k not in drop]
+            v_of_k = v_of_k[keep]
+            cov = cov[keep]
+        return RefPatches(self.store, v_of_k, prof, table, covered=cov)

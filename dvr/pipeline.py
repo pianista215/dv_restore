@@ -23,6 +23,7 @@ import numpy as np
 from . import conceal as cc
 from . import merge as mg
 from . import outliers
+from . import shuffle
 from .dvfile import Capture
 from .match import build_index, window_clips
 
@@ -57,7 +58,7 @@ def _core_range(idx, cap_index, off_lo, off_hi, first, last):
 
 def run_windows(base_path, donor_paths, out_dir, width=750, step=600,
                 margin=30, thr=20.0, max_dist=25, hysteresis=0.20,
-                budget=None, verbose=True):
+                budget=None, verbose=True, ref=None):
     base = Capture(base_path)
     prof = base.prof
     clips_dir = os.path.join(out_dir, "clips")
@@ -125,8 +126,23 @@ def run_windows(base_path, donor_paths, out_dir, width=750, step=600,
             k1 = int(k1 - (shift[k1 - 1] if k1 > 0 else 0))
             if verbose:
                 print(f"  descartados {len(drop)} frames fuera de sitio")
+        # la referencia se reparte DESPUES del descarte: el mapa es un array
+        # paralelo a `frames` y hay que filtrarlo igual, o la ventana entera
+        # queda desplazada (invisible en lo quieto, demoledor en un barrido)
+        refp = None
+        if ref is not None:
+            table = shuffle.load(prof)
+            refp = ref.for_window(idx, bi, lo, prof, table, drop=drop)
+            if refp is not None and len(refp.v) != len(frames):
+                raise RuntimeError(
+                    f"la referencia trae {len(refp.v)} frames y la ventana "
+                    f"tiene {len(frames)}: el descarte no se ha aplicado igual")
         cleaned, rep = cc.conceal_sequence(frames, prof, max_dist=max_dist,
-                                           thr=thr)
+                                           thr=thr, ref=refp)
+        if verbose and refp is not None:
+            print(f"  DVD: escribe {rep['ref_written']} macrobloques, "
+                  f"rescata {rep['ref_rescued_motion']} de los rechazados por "
+                  f"movimiento, descarta {rep['ref_gated']} por desconfianza")
         tmp = core + ".part"
         with open(tmp, "wb") as fh:
             for k in range(k0, k1):

@@ -491,3 +491,147 @@ class TestOrder(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRefGeometry(unittest.TestCase):
+    """La geometria entre el video de referencia y el DV.
+
+    Medida sobre los ficheros reales: columna x del VOB es la x+8 del DV, fila
+    y es la y+1, sin reescalado. El orden de campos se fijo con movimiento (ver
+    dvr/refvideo.py); aqui solo se comprueba que lo que dice el FieldMap es lo
+    que se lee.
+    """
+
+    def test_default_fieldmap_matches_ref_dy(self):
+        from dvr.refvideo import FieldMap, REF_DY
+        fm = FieldMap()
+        # el mapa por defecto tiene que reducirse a un desplazamiento unico y
+        # coincidir con REF_DY, o la geometria y los campos se contradicen
+        self.assertEqual(fm.uniform_shift, -REF_DY)
+
+    def test_coverage_is_1505_of_1620(self):
+        from dvr.refvideo import CELL_R0, CELL_R1, CELL_C0, CELL_C1
+        from dvr.layout import PAL
+        n = (CELL_R1 - CELL_R0) * (CELL_C1 - CELL_C0)
+        self.assertEqual(n, 1505)
+        self.assertLess(n, PAL.n_video)
+        # se pierden la fila 0 y las columnas 0 y 44: las que caen fuera del
+        # recorte de 8 columnas por lado y de la linea de desplazamiento
+        self.assertEqual(CELL_R0, 1)
+        self.assertEqual((CELL_C0, CELL_C1), (1, 44))
+
+    def test_signature_is_the_right_16x16_means(self):
+        from dvr.refvideo import _signature, REF_W, REF_H, REF_DX, REF_DY
+        from dvr.refvideo import CELL_R0, CELL_C0
+        rng = np.random.default_rng(3)
+        V = rng.integers(0, 255, (REF_H, REF_W), dtype=np.uint8)
+        s = _signature(V)
+        for R, C in ((0, 0), (7, 11), (34, 42)):
+            r0 = 16 * (CELL_R0 + R) - REF_DY
+            c0 = 16 * (CELL_C0 + C) - REF_DX
+            want = V[r0:r0 + 16, c0:c0 + 16].mean()
+            self.assertAlmostEqual(float(s[R, C]), float(want), places=3)
+
+
+class TestRefAlign(unittest.TestCase):
+    """La programacion dinamica de la alineacion.
+
+    El caso que importa es el tramo estatico: con planos fijos la correlacion
+    empata (medido: 0,6343 contra 0,6212 en el segundo candidato) y un argmax
+    por frame se la juega a cara o cruz.
+    """
+
+    @staticmethod
+    def _synthetic(n_ref=500, seed=11):
+        rng = np.random.default_rng(seed)
+        sig = rng.normal(size=(n_ref, 35, 43)).astype(np.float32)
+        # 40 frames casi identicos: el tramo que hunde al argmax
+        for i in range(200, 240):
+            sig[i] = sig[200] + rng.normal(scale=0.01, size=(35, 43))
+        return sig
+
+    def _run(self, corrupt=0.0, seed=11):
+        from dvr.refvideo import align
+        ref = self._synthetic(seed=seed)
+        # mapa conocido: pendiente 1 con tres saltos
+        truth, v = [], 30
+        for f in range(300):
+            truth.append(v)
+            v += 1 + (3 if f in (80, 150) else 0) + (5 if f == 220 else 0)
+        truth = np.array(truth)
+        dv = ref[truth] * 0.95 + 4.0           # afin fotometrica, no debe afectar
+        used = ref.copy()
+        if corrupt:
+            rng = np.random.default_rng(99)
+            bad = rng.choice(len(used), int(corrupt * len(used)), replace=False)
+            bad = [b for b in bad if b not in set(truth.tolist())]
+            used[bad] = rng.normal(size=(len(bad), 35, 43))
+        health = np.ones(len(dv), np.float32)
+        got, cost, margin = align(used, dv, health, band=40, max_skip=8,
+                                  every=10, verbose=False)
+        return truth, got
+
+    def test_recovers_a_known_map_through_a_static_run(self):
+        truth, got = self._run()
+        self.assertTrue((truth == got).all(),
+                        f"{int((truth != got).sum())} frames mal de {len(truth)}")
+
+    def test_survives_corrupt_reference_frames(self):
+        truth, got = self._run(corrupt=0.05)
+        self.assertTrue((truth == got).all(),
+                        f"{int((truth != got).sum())} frames mal de {len(truth)}")
+
+
+class TestRefConceal(unittest.TestCase):
+    """La referencia entrando en la ocultacion."""
+
+    class _FakeRef:
+        """Devuelve siempre el mismo parche y siempre se fia de el."""
+
+        def __init__(self, value=140.0):
+            self.value = value
+            self.asked = 0
+
+        def bind(self, luma, ok_of):
+            pass
+
+        def __call__(self, i, k):
+            self.asked += 1
+            return np.full((16, 16), self.value, np.float64)
+
+        def local_rmse(self, i, k, ok_grid):
+            return 0.0
+
+    def _frames(self):
+        from dvr.dvfile import Capture
+        p = any_dv()
+        if p is None:
+            self.skipTest("no hay ningun .dv con el que probar")
+        cap = Capture(p)
+        n = min(12, cap.n)
+        return [cap.frame(i) for i in range(n)], cap.prof
+
+    def test_ref_none_changes_nothing(self):
+        from dvr import conceal as cc
+        frames, prof = self._frames()
+        a, ra = cc.conceal_sequence([f.copy() for f in frames], prof)
+        b, rb = cc.conceal_sequence([f.copy() for f in frames], prof, ref=None)
+        for x, y in zip(a, b):
+            self.assertTrue((x == y).all())
+        self.assertEqual(ra["filled"], rb["filled"])
+
+    def test_ref_writes_and_the_segment_still_parses(self):
+        from dvr import conceal as cc, native, dcplane
+        frames, prof = self._frames()
+        if not any((dcplane.sta(f, prof) != 0).any() for f in frames):
+            self.skipTest("este material no tiene macrobloques danados")
+        ref = self._FakeRef()
+        out, rep = cc.conceal_sequence([f.copy() for f in frames], prof, ref=ref)
+        self.assertGreater(ref.asked, 0, "no se ha consultado la referencia")
+        self.assertGreater(rep["ref_written"], 0)
+        # la invariante que no se salta: todo segmento escrito vuelve a parsear
+        self.assertEqual(rep["invalid_written"], 0)
+        for f in out:
+            for s in range(0, prof.n_seg, 37):
+                off = int(prof.seg[s, 0])
+                self.assertTrue(native.parse(bytes(f[off:off + 400])).ok)

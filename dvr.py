@@ -497,10 +497,21 @@ def cmd_runall(args):
     from dvr.dvfile import Capture
     from dvr.pipeline import run_windows, concat
     base = Capture(args.base)
+    ref = None
+    if args.ref:
+        from dvr.refvideo import RefPlan
+        ref = RefPlan(args.ref)
+        if ref.base_name != base.name or ref.base_n != base.n:
+            raise SystemExit(
+                f"el mapa de la referencia se hizo sobre {ref.base_name} "
+                f"({ref.base_n} frames), no sobre {base.name} ({base.n})")
+        print(f"referencia: {ref.store.n} frames, "
+              f"{ref.covered.mean():.1%} de la base cubierta")
     cores, total = run_windows(args.base, args.donors, args.out,
                                width=args.width, step=args.step,
                                margin=args.margin, thr=args.threshold,
-                               hysteresis=args.hysteresis, budget=args.budget)
+                               hysteresis=args.hysteresis, budget=args.budget,
+                               max_dist=args.max_dist, ref=ref)
     print(f"\nventanas hechas: {len(cores)} de {total}")
     if len(cores) < total:
         print("vuelve a lanzar el mismo comando para seguir donde se quedo")
@@ -708,6 +719,9 @@ def main():
     p.add_argument("--margin", type=int, default=30)
     p.add_argument("--threshold", type=float, default=20.0)
     p.add_argument("--hysteresis", type=float, default=0.20)
+    p.add_argument("--max-dist", type=int, default=25)
+    p.add_argument("--ref", help="directorio con el video de referencia ya "
+                                 "extraido y alineado (ver refextract/refalign)")
     p.add_argument("--budget", type=float, default=0,
                    help="segundos antes de parar limpiamente (0 = sin limite)")
     p.set_defaults(func=cmd_runall)
