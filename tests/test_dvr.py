@@ -682,3 +682,83 @@ class TestIndexIO(unittest.TestCase):
                 load_index(path)
         finally:
             os.unlink(path)
+
+
+class TestRefClean(unittest.TestCase):
+    """Reparacion de macrobloques falsamente sanos.
+
+    Son los que la camara da por buenos y llevan basura escrita en la cinta.
+    No los detecta nada interno (las ocho pasadas los leen igual): hace falta
+    una observacion externa. Medido en un frame del arranque: 24 marcados con
+    error frente a 207 que discrepan del video de referencia.
+    """
+
+    def test_seam_spots_a_block_that_does_not_join(self):
+        from dvr.refclean import seam
+        from dvr.layout import PAL
+        rng = np.random.default_rng(5)
+        # fondo SUAVE: una rampa con un poco de grano. Un macrobloque sano
+        # continua a sus vecinos, asi que el salto en el borde es del orden
+        # del gradiente de al lado y la razon sale cerca de 1.
+        yy, xx = np.mgrid[0:PAL.height, 0:PAL.width]
+        luma = 60 + 0.12 * xx + 0.05 * yy + rng.normal(0, 1.5, (PAL.height, PAL.width))
+        limpio = seam(luma, 10, 10, PAL)
+        self.assertLess(limpio, 4.0, "un bloque sano no deberia tener costura")
+        # el mismo macrobloque con basura dentro: deja de pegar con el vecino
+        roto = luma.copy()
+        roto[160:176, 160:176] += rng.normal(0, 3, (16, 16)) + 45
+        self.assertGreater(seam(roto, 10, 10, PAL), 3 * limpio)
+
+    def test_disagreement_is_nan_outside_coverage(self):
+        from dvr.refclean import disagreement
+        from dvr.layout import PAL
+        from dvr import shuffle
+        try:
+            table = shuffle.load(PAL)
+        except Exception:
+            self.skipTest("falta la tabla de barajado")
+        rows = np.asarray(table) // PAL.mb_cols
+        cols = np.asarray(table) % PAL.mb_cols
+        rng = np.random.default_rng(1)
+        dv = rng.normal(128, 20, (PAL.height, PAL.width))
+        ref = dv.copy()
+        ref[:16, :] = np.nan            # la fila 0 no la cubre la referencia
+        e, adj = disagreement(dv, ref, PAL, rows, cols,
+                              lambda r, c: 1 <= r < 36 and 1 <= c < 44)
+        self.assertIsNotNone(e)
+        fila0 = [k for k in range(PAL.n_video) if rows[k] == 0]
+        self.assertTrue(np.isnan(e[fila0]).all())
+        dentro = [k for k in range(PAL.n_video)
+                  if 1 <= rows[k] < 36 and 1 <= cols[k] < 44]
+        # identicos salvo el ajuste de niveles: el desacuerdo tiene que ser ~0
+        self.assertLess(float(np.nanmedian(e[dentro])), 0.5)
+
+    def test_untrustworthy_frame_is_left_alone(self):
+        from dvr import refclean
+        from dvr.dvfile import Capture
+        p = any_dv()
+        if p is None:
+            self.skipTest("no hay ningun .dv con el que probar")
+        cap = Capture(p)
+        frames = [cap.frame(i) for i in range(min(3, cap.n))]
+
+        class _Store:
+            n = 10
+            fields = None
+
+            @staticmethod
+            def covers(r, c):
+                return 1 <= r < 36 and 1 <= c < 44
+
+            @staticmethod
+            def frame_dv(v, fm=None):
+                # referencia que no tiene nada que ver: debe rechazarse entera
+                rng = np.random.default_rng(v)
+                return rng.normal(128, 50, (cap.prof.height, cap.prof.width))
+
+        out, rep = refclean.clean_sequence(frames, cap.prof, _Store(),
+                                           np.arange(len(frames)))
+        self.assertEqual(rep["written"], 0)
+        self.assertEqual(rep["frames_skipped"], len(frames))
+        for x, y in zip(frames, out):
+            self.assertTrue((x == y).all())
