@@ -1,99 +1,100 @@
 # CLAUDE.md
 
-Guía para trabajar en este repositorio.
+Guidance for working in this repository.
 
-## Qué es
+## What this is
 
-Herramientas para restaurar cintas MiniDV deterioradas combinando varias
-pasadas de captura del mismo material. No es un reproductor ni un
-transcodificador: opera sobre el flujo DV crudo, a nivel de macrobloque.
+Tools to restore a degraded MiniDV tape by combining several capture passes of
+the same material. It is not a player and not a transcoder: it operates on the
+raw DV stream, at macroblock level.
 
-## Reglas que no se saltan
+## Rules that are not bent
 
-- **Los `.dv` de origen son sagrados.** Se abren siempre con
-  `np.memmap(..., mode="r")`. Nunca se escriben, se mueven ni se borran.
-- **Nada de material de vídeo al repositorio.** El `.gitignore` excluye `*.dv`,
-  `*.mp4`, `*.png`, y los directorios `clips/`, `work/`, `out/`. Si añades una
-  salida nueva, añádela también al `.gitignore`.
-- **Todo segmento que se escriba tiene que volver a parsear.** Es la invariante
-  que evita las franjas negras. Si al mezclar no caben los coeficientes, se
-  recortan las frecuencias altas conservando el EOB (`dvr/fixup.py`); nunca se
-  deja que el empaquetador pierda el final.
-- **Medir antes de afirmar.** Cada decisión de este repo salió de una medición,
-  y varias hipótesis razonables resultaron falsas al medirlas. Si cambias un
-  umbral, enseña el número que lo justifica.
+- **The source `.dv` files are sacred.** Always opened with
+  `np.memmap(..., mode="r")`. Never written, moved or deleted.
+- **No video material in the repository.** `.gitignore` excludes `*.dv`,
+  `*.mp4`, `*.png`, and the `clips/`, `work/` and `out/` directories. If you add
+  a new output, add it to `.gitignore` too.
+- **Every segment that gets written must parse again.** That is the invariant
+  that keeps black stripes out of the picture. If the coefficients do not fit
+  when merging, the highest frequencies are trimmed while the EOB is preserved
+  (`dvr/fixup.py`); never let the packer lose the end of a block.
+- **Measure before you claim.** Every decision in this repo came out of a
+  measurement, and several reasonable-sounding hypotheses turned out to be false
+  once measured. If you change a threshold, show the number that justifies it.
 
-## Arquitectura, en una frase cada pieza
+## Architecture, one line each
 
-- `dvr/layout.py` — geometría del frame DV. La unidad de trabajo es el
-  **segmento de vídeo** (5 macrobloques, 400 bytes), no el bloque DIF de 80:
-  los 5 comparten el desbordamiento VLC y tocar uno rompe los otros cuatro.
-- `dvr/bitstream.py` — parser y repaquetizador de segmento. Versión de
-  referencia en Python, verificada con round-trip byte a byte.
-- `dvr/_native/dvbits.c` + `dvr/native.py` — lo mismo en C, 85× más rápido. Se
-  compila solo con gcc la primera vez y cachea el `.so` en `work/`.
-- `dvr/dcplane.py` — DC, modo DCT, clase, STA y QNO de forma vectorizada, sin
-  decodificar. El DC está en posición fija, así que sale gratis.
-- `dvr/shuffle.py` — bloque del flujo → macrobloque de la pantalla, deducido
-  del propio decodificador.
-- `dvr/match.py` — emparejado N-way e índice de frames de cinta.
-- `dvr/merge.py` — fusión por macrobloque. `dvr/conceal.py` — ocultación.
-- `dvr/pipeline.py` — proceso completo por ventanas, resumible.
+- `dvr/layout.py` — DV frame geometry. The unit of work is the **video
+  segment** (5 macroblocks, 400 bytes), not the 80-byte DIF block: the five
+  share the VLC overflow, so touching one breaks the other four.
+- `dvr/bitstream.py` — segment parser and repacker. Reference implementation in
+  Python, verified byte-for-byte by round-trip.
+- `dvr/_native/dvbits.c` + `dvr/native.py` — the same thing in C, 85x faster.
+  Compiles itself with gcc on first use and caches the `.so` in `work/`.
+- `dvr/dcplane.py` — DC, DCT mode, class, STA and QNO, vectorized, without
+  decoding. The DC sits at a fixed bit position, so it comes for free.
+- `dvr/shuffle.py` — stream block -> screen macroblock, deduced from the
+  decoder itself.
+- `dvr/match.py` — N-way matching and the tape-frame index.
+- `dvr/merge.py` — per-macroblock merging. `dvr/conceal.py` — concealment.
+- `dvr/pipeline.py` — the full windowed run, resumable.
 
-## Cosas del material que conviene saber
+## Things worth knowing about this material
 
-- **La cámara ya oculta los errores** antes de sacar el vídeo, y marca lo
-  ocultado con `STA = 0xE`. Un bloque marcado no es basura: es la estimación de
-  la cámara. Lo que se mide no es "cuántos bloques están rotos" sino **cuántos
-  llevan dato real y cuántos una estimación**.
-- **El daño tiene periodo 5.** Las sondas de emparejado se eligen por sorteo
-  fijo, nunca a paso constante: un paso múltiplo de 5 hace que todas caigan en
-  una posición siempre rota.
-- **Los ID DIF difieren entre capturas** aunque el contenido sea idéntico. Al
-  copiar hay que reponerlos.
-- **Una captura no puede leer dos veces el mismo frame de cinta.** El union-find
-  rechaza esas uniones: aceptarlas crea ciclos en el grafo de orden y un ciclo
-  temprano desordena todo lo que va detrás.
+- **The camera already conceals errors** before it outputs video, and marks what
+  it concealed with `STA = 0xE`. A marked block is not garbage: it is the
+  camera's estimate. What you measure is not "how many blocks are broken" but
+  **how many carry real data and how many carry an estimate**.
+- **The damage has period 5.** Match probes are drawn from a fixed random seed,
+  never at a constant stride: a stride that is a multiple of 5 lands every
+  single probe on a position that is always broken.
+- **DIF IDs differ between captures** even when the content is identical. When
+  you copy a block you have to put them back.
+- **One capture cannot read the same tape frame twice.** The union-find refuses
+  those unions: accepting them creates cycles in the ordering graph, and one
+  early cycle scrambles everything behind it.
 
-## Cosas que parecían buena idea y NO funcionan
+## Things that seemed like a good idea and do NOT work
 
-Medidas y descartadas. No las reintentes sin leer esto.
+Measured and discarded. Do not retry them without reading this.
 
-- **Elegir el origen de la copia por la estructura del ECC.** El daño de estas
-  cintas golpea siempre la misma posición dentro del segmento de vídeo, y el
-  barajado convierte eso en una banda de 9 columnas que cruza la pantalla: m=3
-  son las columnas 0-8, m=1 las 9-17, m=0 las 18-26, m=2 las 27-35 y m=4 las
-  36-44. Cuando la posición que falla deriva, la banda nace en el centro y se va
-  a la derecha hasta salirse. Explica perfectamente el artefacto, pero preferir
-  orígenes con esa banda fría **empeora**: error mediano 2,2 -> 3,0 donde cambia
-  la elección, peor en el 52% de los casos. Los orígenes estructuralmente
-  limpios están más lejos en el tiempo y eso cuesta más de lo que gana.
-  Desempatar solo entre candidatos a igual distancia es todavía peor (media 4,6
-  -> 9,3). **La cercanía temporal domina.**
+- **Choosing the copy source by ECC structure.** The damage on these tapes
+  always hits the same position within the video segment, and the shuffle turns
+  that into a 9-column band crossing the screen: m=3 is columns 0-8, m=1 is
+  9-17, m=0 is 18-26, m=2 is 27-35 and m=4 is 36-44. When the failing position
+  drifts, the band is born in the centre and walks right until it leaves the
+  frame. It explains the artifact perfectly, but preferring sources whose band
+  is elsewhere makes things **worse**: median error 2.2 -> 3.0 where it changes
+  the choice, worse in 52% of cases. Structurally clean sources are further away
+  in time, and that costs more than it gains. Using it only to break ties
+  between candidates at equal distance is worse still (mean 4.6 -> 9.3).
+  **Temporal proximity dominates.**
 
-- **Estabilizar el lienzo entre frames consecutivos.** El lienzo saltaba de
-  captura en el 31% de las transiciones y la diferencia media era mayor cuando
-  cambiaba (11,3 frente a 7,5). Parecía causal y no lo era: bajarlo al 8% no
-  movió ni un salto. El lienzo cambia donde hay más daño, y hay más daño donde
-  la imagen se mueve. Se dejó puesto porque mantiene coherentes el subcódigo y
-  el audio, no porque arregle nada.
+- **Stabilizing the canvas between consecutive frames.** The canvas jumped from
+  one capture to another in 31% of transitions, and the mean difference was
+  larger when it changed (11.3 against 7.5). It looked causal and it was not:
+  bringing it down to 8% did not move a single jump. The canvas changes where
+  there is more damage, and there is more damage where the picture moves. It was
+  kept because it keeps subcode and audio coherent, not because it fixes
+  anything.
 
-- **Votar por mayoría entre lecturas sanas que discrepan.** Con ocho pasadas
-  solo discrepan 391 bloques de 792 087 (0,049%), todos con mayoría clara: 0,3
-  bloques por frame. Invisible. La basura que queda es idéntica en las ocho
-  pasadas, o sea que está escrita en la cinta.
+- **Majority voting between healthy reads that disagree.** Across eight passes
+  only 391 blocks out of 792,087 disagree (0.049%), all with a clear majority:
+  0.3 blocks per frame. Invisible. The garbage that remains is identical in all
+  eight passes, which means it is written on the tape.
 
-## Pruebas
+## Tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-Son rápidas y cubren las invariantes: tabla VLC, round-trip del parser, que el
-C dé lo mismo que el Python, el recorte por falta de sitio, y el orden
-(huecos, ciclos, cadenas sin enlazar, uniones de la misma captura).
+They are fast and they cover the invariants: the VLC table, the parser
+round-trip, the C agreeing with the Python, trimming when there is no room, and
+the ordering (gaps, cycles, unlinked chains, same-capture unions).
 
-Antes de dar por bueno un cambio en el orden o la fusión, además de las
-pruebas: saca una tira de frames consecutivos y **míralos**. Los números
-globales tapan los desórdenes locales; las dos veces que este repo estuvo mal
-lo detectó el ojo, no la métrica.
+Before calling a change to the ordering or the merging good, on top of the
+tests: pull a strip of consecutive frames and **look at them**. Global numbers
+hide local disorder; both times this repo was wrong, it was the eye that caught
+it, not the metric.
