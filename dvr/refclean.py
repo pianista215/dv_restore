@@ -143,7 +143,7 @@ def local_blockiness(luma, prof, win=2):
 
 def clean_sequence(frames, prof, store, v_of_i, trust=None, table=None,
                    thr_clean=20.0, thr_broken=4.0, blocky_lo=2.4, blocky_hi=3.0,
-                   trust_thr=0.25, min_seam=1.6, detail_floor=6.0,
+                   trust_thr=0.25, max_ratio=2.5, min_seam=1.6, detail_floor=6.0,
                    fm=None, chroma=None, progress=None):
     """Sustituye la luma de los macrobloques falsamente sanos.
 
@@ -162,8 +162,8 @@ def clean_sequence(frames, prof, store, v_of_i, trust=None, table=None,
     cols = np.asarray(table) % prof.mb_cols
     out = [np.array(f) for f in frames]
     rep = dict(frames_skipped=0, flagged=0, rejected_seam=0, written=0,
-               chroma_written=0, partial=0, seg_reverted=0, invalid_written=0,
-               medians=[])
+               chroma_written=0, partial=0, skipped_ratio=0, seg_reverted=0,
+               invalid_written=0, medians=[])
 
     for i in range(len(frames)):
         if progress and i % 25 == 0:
@@ -181,7 +181,21 @@ def clean_sequence(frames, prof, store, v_of_i, trust=None, table=None,
             continue
         rep["medians"].append(float(np.nanmedian(elo)))
 
+        # Ultima defensa, y hace falta: la fiabilidad por vecindario deja
+        # pasar algun frame suelto con la referencia mal puesta (un paneo, un
+        # salto de plano), y ahi el umbral por zona no protege porque el frame
+        # entero discrepa. El desacuerdo tiene que ser EXPLICABLE por lo roto
+        # que esta nuestro cuadro: si discrepa mucho mas de lo que cuadricula,
+        # el equivocado es el de fuera. Medido, separa con holgura: la razon
+        # vale 0,45 a 1,32 en frames correctos, danados incluidos (0,79 en uno
+        # con el 15,9 de cuadriculado), y 10,06 en el frame donde la
+        # referencia estaba mal y le metimos 857 macrobloques de basura.
         bl = local_blockiness(dv, prof)
+        razon = float(np.nanmedian(elo)) / max(float(np.percentile(bl, 75)), 0.1)
+        if razon > max_ratio:
+            rep["frames_skipped"] += 1
+            rep["skipped_ratio"] = rep.get("skipped_ratio", 0) + 1
+            continue
         thr_k = np.interp([bl[int(rows[k]), int(cols[k])]
                            for k in range(prof.n_video)],
                           [blocky_lo, blocky_hi], [thr_clean, thr_broken])

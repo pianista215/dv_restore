@@ -12,6 +12,7 @@
   dvr.py refextract VIDEO --out D extrae un video de referencia (DVD) a luma
   dvr.py refalign BASE.dv --ref D alinea la referencia con la cinta
   dvr.py stretch SRC.dv --to B.dv  pone SRC en la linea temporal de B
+  dvr.py refclean IN.dv --ref D    repara bloques falsamente sanos con la referencia
 
 Todas las rutas de salida van a --out (por defecto work/).
 """
@@ -524,6 +525,85 @@ def cmd_runall(args):
     return 0
 
 
+def cmd_refclean(args):
+    """Repara con el video de referencia los macrobloques que la camara da por
+    sanos y llevan basura. Ver dvr/refclean.py para el criterio."""
+    import json
+    import time
+    import numpy as np
+    from dvr.dvfile import Capture
+    from dvr.refvideo import RefStore, ChromaStore, dv_signatures, align, frame_trust
+    from dvr import refclean, shuffle
+
+    cap = Capture(args.file)
+    prof = cap.prof
+    store = RefStore(args.ref)
+    chroma = None
+    if not args.no_chroma:
+        try:
+            chroma = ChromaStore(args.ref, store.n)
+        except FileNotFoundError:
+            print("  (no hay croma extraido; solo se reparara la luma)")
+
+    cache = args.align or os.path.join(
+        args.ref, "refvideo", f"align_{os.path.splitext(cap.name)[0]}.json")
+    if os.path.exists(cache):
+        d = json.load(open(cache))
+        if d.get("n") == cap.n:
+            v = np.array(d["map"], np.int64)
+            cost = np.array(d["cost"], np.float64)
+            print(f"mapa cacheado: {cache}")
+        else:
+            d = None
+    else:
+        d = None
+    if d is None:
+        print("alineando con la referencia...")
+        sig, health = dv_signatures(cap)
+        v, cost, _ = align(np.asarray(store.sigs), sig, health, band=args.band,
+                           max_skip=args.max_skip, lam=args.lam, mu=args.mu)
+        json.dump({"n": int(cap.n), "map": [int(x) for x in v],
+                   "cost": [round(float(x), 5) for x in cost]}, open(cache, "w"))
+        print(f"  guardado en {cache}")
+    trust = frame_trust(cost)
+    util = float((trust < args.trust).mean())
+    print(f"{cap.n} frames; la referencia sirve en {100*util:.0f}% de ellos")
+
+    table = shuffle.load(prof)
+    tot = dict(frames_skipped=0, flagged=0, rejected_seam=0, written=0,
+               chroma_written=0, partial=0, skipped_ratio=0, seg_reverted=0,
+               invalid_written=0)
+    t0 = time.time()
+    tmp = args.out + ".part"
+    with open(tmp, "wb") as fh:
+        for a in range(0, cap.n, args.chunk):
+            b = min(a + args.chunk, cap.n)
+            out, rep = refclean.clean_sequence(
+                [cap.frame(i) for i in range(a, b)], prof, store, v[a:b],
+                trust=trust[a:b], table=table, chroma=chroma,
+                thr_clean=args.thr_clean, thr_broken=args.thr_broken,
+                trust_thr=args.trust, max_ratio=args.max_ratio)
+            for f in out:
+                fh.write(f.tobytes())
+            for k in tot:
+                tot[k] += rep[k]
+            el = time.time() - t0
+            print(f"  {b}/{cap.n}  ({el:.0f}s, faltan ~{el*(cap.n-b)/max(b,1):.0f}s)"
+                  f"  reparados {tot['written']}")
+    os.replace(tmp, args.out)
+    print()
+    print(f"{'':<22}{'total':>10}{'por frame':>12}")
+    for k in ("flagged", "rejected_seam", "written", "chroma_written", "partial"):
+        print(f"  {k:<20}{tot[k]:>10}{tot[k]/cap.n:>12.1f}")
+    print(f"  {'frames sin referencia':<20}{tot['frames_skipped']:>10}")
+    print(f"  {'  de ellos, por razon':<20}{tot['skipped_ratio']:>10}")
+    print(f"  {'segmentos revertidos':<20}{tot['seg_reverted']:>10}")
+    print(f"  {'invalidos escritos':<20}{tot['invalid_written']:>10}")
+    print()
+    print(f"-> {args.out}")
+    return 0
+
+
 def cmd_stretch(args):
     """Pone una captura sobre la linea temporal de otra, congelando donde no
     tiene frames. Es lo que hace falta para comparar el original con el
@@ -802,6 +882,27 @@ def main():
     p.add_argument("--uncovered", type=float, default=0.05,
                    help="coste por encima del cual la referencia no lo tiene")
     p.set_defaults(func=cmd_refalign)
+
+    p = sub.add_parser("refclean",
+                       help="repara bloques falsamente sanos con la referencia")
+    p.add_argument("file")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--align", help="mapa cacheado (por defecto, junto a la referencia)")
+    p.add_argument("--thr-clean", type=float, default=20.0,
+                   help="umbral donde la imagen no cuadricula")
+    p.add_argument("--thr-broken", type=float, default=4.0,
+                   help="umbral donde si cuadricula")
+    p.add_argument("--trust", type=float, default=0.25)
+    p.add_argument("--max-ratio", type=float, default=2.5,
+                   help="desacuerdo maximo en relacion a lo que cuadricula")
+    p.add_argument("--chunk", type=int, default=500)
+    p.add_argument("--no-chroma", action="store_true")
+    p.add_argument("--band", type=int, default=80)
+    p.add_argument("--max-skip", type=int, default=8)
+    p.add_argument("--lam", type=float, default=0.050)
+    p.add_argument("--mu", type=float, default=0.004)
+    p.set_defaults(func=cmd_refclean)
 
     p = sub.add_parser("stretch",
                        help="pone una captura en la linea temporal de otra")

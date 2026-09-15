@@ -787,3 +787,42 @@ class TestRefClean(unittest.TestCase):
         self.assertEqual(rep["frames_skipped"], len(frames))
         for x, y in zip(frames, out):
             self.assertTrue((x == y).all())
+
+    def test_ratio_guard_refuses_a_misplaced_reference(self):
+        """Si el cuadro no cuadricula y aun asi la referencia discrepa, la
+        equivocada es la referencia.
+
+        Es la ultima defensa, y hace falta: la fiabilidad por vecindario deja
+        pasar frames sueltos con la referencia mal puesta, y ahi el umbral por
+        zona no protege porque discrepa el frame entero. Medido, la razon
+        desacuerdo/cuadriculado vale 0,45-1,32 en frames correctos (danados
+        incluidos) y 10,06 en el que se estropeo.
+        """
+        from dvr import refclean
+        from dvr.dvfile import Capture
+        p = any_dv()
+        if p is None:
+            self.skipTest("no hay ningun .dv con el que probar")
+        cap = Capture(p)
+        frames = [cap.frame(i) for i in range(min(3, cap.n))]
+
+        class _Store:
+            n = 10
+            fields = None
+
+            @staticmethod
+            def covers(r, c):
+                return True
+
+            @staticmethod
+            def frame_dv(v, fm=None):
+                # una referencia plana pero con otro nivel: discrepa en todas
+                # partes sin que nuestro cuadro cuadricule mas de lo normal
+                return np.full((cap.prof.height, cap.prof.width), 40.0)
+
+        out, rep = refclean.clean_sequence(frames, cap.prof, _Store(),
+                                           np.arange(len(frames)))
+        self.assertEqual(rep["written"], 0)
+        self.assertGreater(rep["skipped_ratio"], 0)
+        for x, y in zip(frames, out):
+            self.assertTrue((x == y).all())
