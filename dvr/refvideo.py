@@ -22,6 +22,11 @@ import numpy as np
 
 REF_W, REF_H = 704, 576
 REF_DX, REF_DY = 8, 1
+# Desplazamiento horizontal de subpixel que mete el viaje analogico (D/A del
+# reproductor, A/D del grabador). Medido barriendo el residuo sobre frames
+# limpios: el minimo cae limpio en medio pixel (8,339 frente a 8,581 sin
+# corregir) y es simetrico en vertical, o sea que solo pasa en horizontal.
+REF_SUBX = 0.5
 
 # Celdas de 16x16 del DV que el VOB cubre entera: sobran la fila 0 y las
 # columnas 0 y 44, que se salen del recorte. Son 35*43 = 1505 de 1620 (92,9%).
@@ -229,6 +234,16 @@ class RefStore:
     def sig(self, v):
         return np.asarray(self.sigs[v], np.float32)
 
+    @staticmethod
+    def _subshift(img, dx):
+        """Desplaza la imagen dx pixeles en horizontal, con interpolacion."""
+        if not dx:
+            return img
+        x0 = int(np.floor(dx))
+        f = dx - x0
+        c = np.clip(np.arange(img.shape[1]) + x0, 0, img.shape[1] - 2)
+        return img[:, c] * (1 - f) + img[:, c + 1] * f
+
     def frame_dv(self, v, fm=None):
         """El frame v puesto en la geometria del DV: (576, 720) float32.
 
@@ -249,7 +264,7 @@ class RefStore:
             j = i + line
             ok = (j >= 0) & (j < nf)
             out[2 * i[ok] + p, REF_DX:REF_DX + REF_W] = src[j[ok]]
-        return out
+        return self._subshift(out, REF_SUBX)
 
     def covers(self, r, c):
         """Si la celda (fila, columna) de macrobloque esta cubierta entera."""

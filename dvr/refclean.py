@@ -123,8 +123,27 @@ def seam(luma, r, c, prof):
     return max(vals) if vals else 0.0
 
 
+def local_blockiness(luma, prof, win=2):
+    """Cuanto cuadricula cada zona, en mediana sobre una ventana de macrobloques.
+
+    Es la medida de dano que no depende de la referencia: la basura de cinta y
+    los mosaicos de la ocultacion no empalman con sus vecinos, y una imagen
+    sana si, por muchos bordes que tenga (la costura va normalizada por el
+    gradiente de al lado).
+    """
+    g = np.array([[seam(luma, r, c, prof) for c in range(prof.mb_cols)]
+                  for r in range(prof.mb_rows)])
+    out = np.empty_like(g)
+    for r in range(prof.mb_rows):
+        r0, r1 = max(0, r - win), r + win + 1
+        for c in range(prof.mb_cols):
+            out[r, c] = np.median(g[r0:r1, max(0, c - win):c + win + 1])
+    return out
+
+
 def clean_sequence(frames, prof, store, v_of_i, trust=None, table=None,
-                   thr=4.0, trust_thr=0.25, min_seam=1.6, detail_floor=6.0,
+                   thr_clean=20.0, thr_broken=4.0, blocky_lo=2.4, blocky_hi=3.0,
+                   trust_thr=0.25, min_seam=1.6, detail_floor=6.0,
                    fm=None, chroma=None, progress=None):
     """Sustituye la luma de los macrobloques falsamente sanos.
 
@@ -162,7 +181,11 @@ def clean_sequence(frames, prof, store, v_of_i, trust=None, table=None,
             continue
         rep["medians"].append(float(np.nanmedian(elo)))
 
-        cand = np.nonzero(np.nan_to_num(elo) > thr)[0]
+        bl = local_blockiness(dv, prof)
+        thr_k = np.interp([bl[int(rows[k]), int(cols[k])]
+                           for k in range(prof.n_video)],
+                          [blocky_lo, blocky_hi], [thr_clean, thr_broken])
+        cand = np.nonzero(np.nan_to_num(elo) > thr_k)[0]
         if not len(cand):
             continue
         rep["flagged"] += len(cand)
