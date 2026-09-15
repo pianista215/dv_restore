@@ -335,7 +335,7 @@ def _anchors(R, D, health, every=25, min_corr=0.90, min_health=0.30):
 
 
 def align(sig_ref, sig_dv, health, band=60, max_skip=24, lam=0.010, mu=0.060,
-          every=25, verbose=True):
+          every=25, no_match=0.20, verbose=True):
     """Mapa frame del DV -> frame del video de referencia.
 
     Programacion dinamica monotona y bandeada. Las transiciones son:
@@ -349,6 +349,8 @@ def align(sig_ref, sig_dv, health, band=60, max_skip=24, lam=0.010, mu=0.060,
     los vecinos de los dos lados.
 
     Devuelve (v_of_f, cost_of_f, margin_of_f), los tres de longitud n_dv.
+    cost_of_f es el coste REAL (no el puesto a cero para la DP), asi que un
+    frame sin pareja sale con coste alto y la fiabilidad lo rechaza.
     margin_of_f es cuanto mejor es el mejor candidato de la banda frente al
     mejor NO adyacente: por debajo de ~0,03 el frame no se distingue solo.
     """
@@ -381,6 +383,22 @@ def align(sig_ref, sig_dv, health, band=60, max_skip=24, lam=0.010, mu=0.060,
     hi = np.percentile(cost, 90, axis=1, keepdims=True)
     cost = np.minimum(cost, hi)
     cost[health < 0.05] = 0.0        # frame casi todo invencion: que decida el prior
+
+    # Un frame que no casa en NINGUN sitio no tiene que opinar. Si se le deja,
+    # elige el menos malo de entre los malos, y como el camino es monotono esa
+    # eleccion arbitraria le impide volver: medido en el arranque de este
+    # material, los 84 primeros frames no estan en el DVD (empieza despues),
+    # sus costes rondan 0,4-1,4 en toda la banda y resultaban ser un pelin
+    # menores en v=25; el camino se iba alli y ya no podia bajar a v=0 en el
+    # frame 84, donde el coste real es 0,0015. Se perdian los dos primeros
+    # segundos, que es justo donde mas dano hay.
+    sin_pareja = cost.min(axis=1) > no_match
+    real = cost.copy()               # el coste de verdad, para informar y para
+    cost[sin_pareja] = 0.0           # la fiabilidad; el puesto a cero es solo
+                                     # para que la DP no se deje arrastrar
+    if verbose and sin_pareja.any():
+        print(f"  frames sin pareja en la referencia: {int(sin_pareja.sum())} "
+              f"(no votan; el camino los atraviesa con el prior)")
 
     margin = np.empty(ndv, np.float32)
     for f in range(ndv):
@@ -419,7 +437,7 @@ def align(sig_ref, sig_dv, health, band=60, max_skip=24, lam=0.010, mu=0.060,
     cost_of_f = np.empty(ndv, np.float32)
     for f in range(ndv - 1, -1, -1):
         v_of_f[f] = base[f] + j
-        cost_of_f[f] = cost[f, j]
+        cost_of_f[f] = real[f, j]
         if f:
             j = int(bp[f, j])
             if j < 0:
