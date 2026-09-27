@@ -6,11 +6,15 @@
 *.mkv
 *.mp4
 *.wav
+*.vob
+*.VOB
+*.raw
 
 # Directorios de trabajo
 clips/
 work/
 out/
+refvideo/
 
 # Python / build
 __pycache__/

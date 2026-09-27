@@ -155,7 +155,7 @@ class PairMotion:
         return _win_sum(self.Id, r0, r1, c0, c1) / n, int(n)
 
 
-def _budget_for(seg, m):
+def _budget_for(seg, m, with_chroma=False):
     """Bits que le quedan a un macrobloque sin quitarselos a los demas."""
     from .bitstream import VLC_LEN, HDR_BITS
     used = 0
@@ -166,18 +166,43 @@ def _budget_for(seg, m):
             b = seg.mb[mm].b[j]
             used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
                                        for i in range(int(b.ntok))))
-    # los dos bloques de croma del propio macrobloque no se tocan
-    for j in (4, 5):
-        b = seg.mb[m].b[j]
-        used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
-                                   for i in range(int(b.ntok))))
+    if not with_chroma:
+        # los dos bloques de croma del propio macrobloque no se tocan
+        for j in (4, 5):
+            b = seg.mb[m].b[j]
+            used += HDR_BITS + int(sum(int(VLC_LEN[b.tok[i]])
+                                       for i in range(int(b.ntok))))
     return max(0, SEG_CAPACITY - used)
 
 
 def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                      table=None, progress=None, stats=None, verify=True,
                      outlier_factor=3.0, compensate=True, interpolate=True,
-                     interp_span=10):
+                     interp_span=10, ref=None, ref_gate=6.0, ref_cross=2.0):
+    """Rellena los macrobloques sin dato real de cinta.
+
+    'ref' es opcional: una fuente externa de luma (ver dvr/refvideo.py) que
+    responde ref(i, k) -> 16x16 o None. Con ref=None el comportamiento es
+    identico al de siempre.
+
+    Los dos umbrales estan medidos contra verdad de campo (macrobloques sanos,
+    fingiendo que estaban rotos, y puntuando el parche DESPUES del viaje de
+    escritura completo):
+
+      ref_cross = 2   por debajo de esa puntuacion de movimiento copiar del
+                      vecino empata o gana (54% de aciertos para la referencia);
+                      por encima gana la referencia: 69% a 2-5, 81% a 5-10,
+                      87% a 10-20 y 91% a 20-40. El error de la referencia
+                      apenas se mueve con el movimiento (2,75 -> 3,53) mientras
+                      que el de la copia se dispara (2,68 -> 10,85).
+
+      ref_gate = 6    desacuerdo con los macrobloques SANOS que rodean al
+                      destino. Por debajo la referencia gana el 72-80%; por
+                      encima se hunde (28% a 6-10, 8% a 10-20, 1% por encima de
+                      20). Es lo que detecta, por macrobloque y sin suponer
+                      nada, que la referencia esta desalineada, danada o
+                      sencillamente no tiene este material.
+    """
     if table is None:
         table = shuffle.load(prof)
     pos = np.asarray(table, np.int64)
@@ -195,8 +220,13 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
     check = [0, 0]
     trimmed = 0
     interpolated = 0
-    luma = _interp.LumaCache(frames, prof) if interpolate else None
+    luma = _interp.LumaCache(frames, prof) if (interpolate or ref) else None
     mvcache = {}
+    if ref is not None:
+        # la referencia necesita la luma del DV para ajustar niveles y para
+        # medir su desacuerdo con los vecinos sanos; se le pasa la que ya hay
+        # en vez de que decodifique los mismos frames por su cuenta
+        ref.bind(luma, lambda i: info[i].grid_ok)
 
     def motion(j1, j2, r, c):
         """Movimiento entre dos frames, cacheado por region de 4x4
@@ -211,6 +241,7 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
     bridged = bridged_try = rescued = shifted = 0
     filled = motion_reject = no_source = no_support = 0
     seg_copied = seg_repacked = seg_reverted = 0
+    ref_used = ref_rescued = ref_no_source = ref_gated = ref_written = 0
     used_win = np.zeros(len(WINDOWS), np.int64)
     diffs = []
 
@@ -227,6 +258,7 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
         blind = int((~bad).sum()) < min_nb
         src = np.full(prof.n_video, -1, np.int64)
         src_blk = np.full(prof.n_video, -1, np.int64)
+        pxr = {}                     # parches de la referencia, por bloque
         for k in np.nonzero(bad)[0]:
             r, c = int(rows[k]), int(cols[k])
             best = None
@@ -276,8 +308,25 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                         best = (est / fac, near, w, est, k)
                         break
                     bridged_try += 1
+            # La referencia solo se consulta donde la copia temporal flojea:
+            # por encima del cruce medido, o donde no hay copia posible. La
+            # cinta manda, y donde la copia va bien no se toca.
+            p = None
+            if ref is not None and (best is None or best[0] > ref_cross):
+                p = ref(i, k)
+                if p is not None and ref.local_rmse(i, k, info[i].grid_ok) > ref_gate:
+                    p = None
+                    ref_gated += 1
+
             if best is None:
-                if not any((not info[j].bad[k]) for j in cand):
+                if p is not None:
+                    # aqui hoy no se arregla nada: se deja la estimacion de la
+                    # camara. Se sustituye solo la luma; el croma que sigue es
+                    # el suyo, que es lo menos arriesgado.
+                    pxr[k] = p
+                    ref_no_source += 1
+                    filled += 1
+                elif not any((not info[j].bad[k]) for j in cand):
                     no_source += 1
                 else:
                     no_support += 1
@@ -294,7 +343,15 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
             d_keep = abs(float(info[i].dcb[k]) - float(info[best[1]].dcb[best[4]]))
             outlier = d_keep > outlier_factor * max(best[3], 4.0)
             if best[0] > thr and not outlier:
-                motion_reject += 1
+                if p is not None:
+                    # donde hoy nos rendimos por movimiento. Medido: ahi la
+                    # referencia da 3,53 de error contra 10,85 de la copia.
+                    # Sin copia estructural: solo se cambia la luma.
+                    pxr[k] = p
+                    ref_rescued += 1
+                    filled += 1
+                else:
+                    motion_reject += 1
             else:
                 src[k] = best[1]
                 src_blk[k] = best[4]
@@ -306,6 +363,11 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                     rescued += 1
                 if blind:
                     bridged += 1
+                if p is not None:
+                    # la copia vale de portador (el croma viene con ella) pero
+                    # la luma la pone la referencia
+                    pxr[k] = p
+                    ref_used += 1
 
         # Interpolar: componer el instante intermedio entre la version buena
         # de antes y la de despues, compensando el movimiento a nivel de
@@ -314,6 +376,8 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
         px = {}
         if interpolate:
             for k in np.nonzero(src >= 0)[0]:
+                if k in pxr:
+                    continue     # la referencia es dato, la interpolacion invento
                 r, c = int(rows[k]), int(cols[k])
                 if not (1 <= r < prof.mb_rows - 2 and 1 <= c < prof.mb_cols - 2):
                     continue
@@ -332,7 +396,15 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                     continue
                 px[k] = (1 - t) * s1 + t * s2
 
-        segs = np.nonzero((src.reshape(prof.n_seg, 5) >= 0).any(axis=1))[0]
+        ref_keys = set(pxr)
+        px.update(pxr)
+        # un segmento hay que repaquetizarlo tambien si solo lleva parche, sin
+        # copia estructural: si no, el parche no llega a escribirse
+        has_px = np.zeros(prof.n_video, bool)
+        if px:
+            has_px[list(px)] = True
+        segs = np.nonzero(((src.reshape(prof.n_seg, 5) >= 0)
+                           | has_px.reshape(prof.n_seg, 5)).any(axis=1))[0]
         if len(segs) == 0:
             continue
         base_ids = out[i][ids]
@@ -373,6 +445,16 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                     # deja de ignorarlo y lo aplica. Se veia como macrobloques
                     # sanos con el color disparatado.
                     sanitize_mb(dst.mb[m], trust)
+                    kk = s * 5 + m
+                    if kk in px:
+                        # parche sin copia estructural: se cambia solo la luma
+                        # y el croma sigue siendo el que habia. Es lo correcto
+                        # aqui, porque lo que habia es la ocultacion de la
+                        # camara, no basura.
+                        _encode.encode_mb(dst, m, px[kk],
+                                          max_bits=_budget_for(dst, m))
+                        dst.mb[m].sta = 0
+                        ref_written += 1
                     continue
                 k2 = int(sb[m])
                 s2, m2 = k2 // 5, k2 % 5
@@ -389,11 +471,17 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                     # sustituye la luma, que es donde se nota el desplazamiento
                     libre = _budget_for(dst, m)
                     _encode.encode_mb(dst, m, px[kk], max_bits=libre)
-                    interpolated += 1
+                    if kk in ref_keys:
+                        ref_written += 1
+                    else:
+                        interpolated += 1
                 for t in range(3):
                     dst.mb[m].id[t] = int(base_ids[s * 5 + m][t])
-            # no tocar los macrobloques que no hemos sustituido: estan sanos
-            keep = tuple(m for m in range(5) if int(ss[m]) < 0)
+            # no tocar los macrobloques que no hemos sustituido: estan sanos.
+            # Los que llevan parche si se pueden recortar: lo que tiene que
+            # ceder es lo nuestro, no el croma de un vecino sano.
+            keep = tuple(m for m in range(5)
+                         if int(ss[m]) < 0 and (s * 5 + m) not in px)
             trimmed += max(0, fit_segment(dst, protect=keep))
             buf, nlost = native.pack(dst, bytes(out[i][off:off + 400]))
             if nlost:
@@ -430,5 +518,8 @@ def conceal_sequence(frames, prof, max_dist=25, thr=20.0, min_nb=6,
                win_used=used_win.tolist(), bridged=bridged,
                rescued=rescued, shifted=shifted, interpolated=interpolated,
                invalid_written=check[0], overflow=check[1], trimmed=trimmed,
+               ref_used=ref_used, ref_rescued_motion=ref_rescued,
+               ref_no_source=ref_no_source, ref_gated=ref_gated,
+               ref_written=ref_written,
                diffs=np.array(diffs) if diffs else np.zeros(0))
     return out, rep

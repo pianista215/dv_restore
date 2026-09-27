@@ -38,6 +38,9 @@ raw DV stream, at macroblock level.
   decoder itself.
 - `dvr/match.py` — N-way matching and the tape-frame index.
 - `dvr/merge.py` — per-macroblock merging. `dvr/conceal.py` — concealment.
+- `dvr/refvideo.py` — an optional external reference (a DVD of the same tape).
+  Everything that knows about MPEG-2 lives here; the rest of the repo only ever
+  sees `ref(i, k) -> 16x16 luma | None`.
 - `dvr/pipeline.py` — the full windowed run, resumable.
 
 ## Things worth knowing about this material
@@ -51,6 +54,12 @@ raw DV stream, at macroblock level.
   single probe on a position that is always broken.
 - **DIF IDs differ between captures** even when the content is identical. When
   you copy a block you have to put them back.
+- **Asking ffmpeg for `gray` expands the studio range.** Measured on both
+  paths: `gray = 1.1348*Y - 14.95`, i.e. 16-235 stretched to 0-255. On DV,
+  decode `yuv420p` and slice the Y plane (`render.decode(..., "yraw")`); on
+  MPEG-2, use `-vf extractplanes=y`, which is byte-identical to the Y plane.
+  `refvideo.check_range_safe()` asserts this rather than trusting it, because
+  the same trap has already cost an hour once.
 - **One capture cannot read the same tape frame twice.** The union-find refuses
   those unions: accepting them creates cycles in the ordering graph, and one
   early cycle scrambles everything behind it.

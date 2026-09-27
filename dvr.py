@@ -9,6 +9,10 @@
   dvr.py compare A.dv B.dv --frames A-B   comparativa lado a lado
   dvr.py index FICHERO...         construye el indice de frames de cinta
   dvr.py merge ...                fusiona (ver dvr.py merge -h)
+  dvr.py refextract VIDEO --out D extrae un video de referencia (DVD) a luma
+  dvr.py refalign BASE.dv --ref D alinea la referencia con la cinta
+  dvr.py stretch SRC.dv --to B.dv  pone SRC en la linea temporal de B
+  dvr.py refclean IN.dv --ref D    repara bloques falsamente sanos con la referencia
 
 Todas las rutas de salida van a --out (por defecto work/).
 """
@@ -495,10 +499,21 @@ def cmd_runall(args):
     from dvr.dvfile import Capture
     from dvr.pipeline import run_windows, concat
     base = Capture(args.base)
+    ref = None
+    if args.ref:
+        from dvr.refvideo import RefPlan
+        ref = RefPlan(args.ref)
+        if ref.base_name != base.name or ref.base_n != base.n:
+            raise SystemExit(
+                f"el mapa de la referencia se hizo sobre {ref.base_name} "
+                f"({ref.base_n} frames), no sobre {base.name} ({base.n})")
+        print(f"referencia: {ref.store.n} frames, "
+              f"{ref.covered.mean():.1%} de la base cubierta")
     cores, total = run_windows(args.base, args.donors, args.out,
                                width=args.width, step=args.step,
                                margin=args.margin, thr=args.threshold,
-                               hysteresis=args.hysteresis, budget=args.budget)
+                               hysteresis=args.hysteresis, budget=args.budget,
+                               max_dist=args.max_dist, ref=ref)
     print(f"\nventanas hechas: {len(cores)} de {total}")
     if len(cores) < total:
         print("vuelve a lanzar el mismo comando para seguir donde se quedo")
@@ -507,6 +522,207 @@ def cmd_runall(args):
     print(f"\nmontado: {n} frames ({n/25:.1f}s) -> {args.final}")
     print(f"la base tenia {base.n} frames ({base.n/25:.1f}s)  "
           f"-> +{n-base.n} frames recuperados")
+    return 0
+
+
+def cmd_refclean(args):
+    """Repara con el video de referencia los macrobloques que la camara da por
+    sanos y llevan basura. Ver dvr/refclean.py para el criterio."""
+    import json
+    import time
+    import numpy as np
+    from dvr.dvfile import Capture
+    from dvr.refvideo import RefStore, ChromaStore, dv_signatures, align, frame_trust
+    from dvr import refclean, shuffle
+
+    cap = Capture(args.file)
+    prof = cap.prof
+    store = RefStore(args.ref)
+    chroma = None
+    if not args.no_chroma:
+        try:
+            chroma = ChromaStore(args.ref, store.n)
+        except FileNotFoundError:
+            print("  (no hay croma extraido; solo se reparara la luma)")
+
+    cache = args.align or os.path.join(
+        args.ref, "refvideo", f"align_{os.path.splitext(cap.name)[0]}.json")
+    if os.path.exists(cache):
+        d = json.load(open(cache))
+        if d.get("n") == cap.n:
+            v = np.array(d["map"], np.int64)
+            cost = np.array(d["cost"], np.float64)
+            print(f"mapa cacheado: {cache}")
+        else:
+            d = None
+    else:
+        d = None
+    if d is None:
+        print("alineando con la referencia...")
+        sig, health = dv_signatures(cap)
+        v, cost, _ = align(np.asarray(store.sigs), sig, health, band=args.band,
+                           max_skip=args.max_skip, lam=args.lam, mu=args.mu)
+        json.dump({"n": int(cap.n), "map": [int(x) for x in v],
+                   "cost": [round(float(x), 5) for x in cost]}, open(cache, "w"))
+        print(f"  guardado en {cache}")
+    trust = frame_trust(cost)
+    util = float((trust < args.trust).mean())
+    print(f"{cap.n} frames; la referencia sirve en {100*util:.0f}% de ellos")
+
+    table = shuffle.load(prof)
+    tot = dict(frames_skipped=0, flagged=0, rejected_seam=0, written=0,
+               chroma_written=0, partial=0, skipped_ratio=0, seg_reverted=0,
+               invalid_written=0)
+    t0 = time.time()
+    tmp = args.out + ".part"
+    with open(tmp, "wb") as fh:
+        for a in range(0, cap.n, args.chunk):
+            b = min(a + args.chunk, cap.n)
+            out, rep = refclean.clean_sequence(
+                [cap.frame(i) for i in range(a, b)], prof, store, v[a:b],
+                trust=trust[a:b], table=table, chroma=chroma,
+                thr_clean=args.thr_clean, thr_broken=args.thr_broken,
+                trust_thr=args.trust, max_ratio=args.max_ratio)
+            for f in out:
+                fh.write(f.tobytes())
+            for k in tot:
+                tot[k] += rep[k]
+            el = time.time() - t0
+            print(f"  {b}/{cap.n}  ({el:.0f}s, faltan ~{el*(cap.n-b)/max(b,1):.0f}s)"
+                  f"  reparados {tot['written']}")
+    os.replace(tmp, args.out)
+    print()
+    print(f"{'':<22}{'total':>10}{'por frame':>12}")
+    for k in ("flagged", "rejected_seam", "written", "chroma_written", "partial"):
+        print(f"  {k:<20}{tot[k]:>10}{tot[k]/cap.n:>12.1f}")
+    print(f"  {'frames sin referencia':<20}{tot['frames_skipped']:>10}")
+    print(f"  {'  de ellos, por razon':<20}{tot['skipped_ratio']:>10}")
+    print(f"  {'segmentos revertidos':<20}{tot['seg_reverted']:>10}")
+    print(f"  {'invalidos escritos':<20}{tot['invalid_written']:>10}")
+    print()
+    print(f"-> {args.out}")
+    return 0
+
+
+def cmd_stretch(args):
+    """Pone una captura sobre la linea temporal de otra, congelando donde no
+    tiene frames. Es lo que hace falta para comparar el original con el
+    resultado: sin esto van desfasados y no se puede juzgar nada.
+
+    Usa la misma programacion dinamica que la alineacion del video de
+    referencia, asi que no necesita indice: vale aunque la restauracion se haya
+    hecho por ventanas y no haya un indice global guardado.
+    """
+    import numpy as np
+    from dvr.dvfile import Capture
+    from dvr.refvideo import dv_signatures, align
+    src = Capture(args.src)
+    dst = Capture(args.to)
+    print(f"origen  : {src.name}  {src.n} frames")
+    print(f"destino : {dst.name}  {dst.n} frames")
+    ssig, shealth = dv_signatures(src)
+    dsig, dhealth = dv_signatures(dst)
+    # para cada frame del destino, cual del origen. Aqui lo ESPERADO son las
+    # repeticiones (el destino tiene mas frames), asi que quedarse quieto es
+    # barato y saltar es caro: al reves que al alinear un video externo.
+    v, cost, margin = align(ssig, dsig, dhealth, band=args.band,
+                            max_skip=args.max_skip, lam=args.lam, mu=args.mu)
+    d = np.diff(v)
+    froze = int((d == 0).sum())
+    print(f"\n  congelados: {froze} frames ({froze/25:.1f}s) que {src.name} "
+          f"no tiene")
+    print(f"  saltos: {int((d > 1).sum())}")
+    print(f"  coste: mediana {np.median(cost):.4f}  p90 {np.percentile(cost,90):.4f}")
+    with open(args.out, "wb") as fh:
+        for i in range(dst.n):
+            fh.write(src.frame(int(v[i])).tobytes())
+    print(f"\n{dst.n} frames -> {args.out}")
+    return 0
+
+
+def cmd_refextract(args):
+    from dvr.refvideo import extract
+    store = extract(args.video, args.out)
+    print(f"\n{store.n} frames ({store.n/25:.1f}s), campos: {store.fields}")
+    return 0
+
+
+def cmd_refalign(args):
+    import json
+    import time
+    from dvr.dvfile import Capture
+    from dvr.refvideo import RefStore, dv_signatures, align
+
+    cap = Capture(args.base)
+    store = RefStore(args.ref)
+    print(f"base      : {cap.name}  {cap.n} frames ({cap.n/25:.1f}s)")
+    print(f"referencia: {store.n} frames ({store.n/25:.1f}s)")
+
+    t = time.time()
+    print("\nfirmas de la base (sin decodificar)...")
+    sig, health = dv_signatures(cap)
+    print(f"  {time.time()-t:.1f}s   salud mediana {np.median(health):.1%}")
+
+    print("\nalineando...")
+    t = time.time()
+    v, cost, margin = align(np.asarray(store.sigs), sig, health,
+                            band=args.band, max_skip=args.max_skip,
+                            lam=args.lam, mu=args.mu)
+    print(f"  {time.time()-t:.1f}s")
+
+    d = np.diff(v)
+    skip = int((d > 1).sum())
+    stay = int((d == 0).sum())
+    print(f"\n  desfase: de {v[0]-0:+d} a {v[-1]-(cap.n-1):+d}")
+    print(f"  saltos (la base perdio frames): {skip}, "
+          f"{int(d[d>1].sum()-skip)} frames de cinta saltados en total")
+    print(f"  repeticiones (frame que la referencia no tiene): {stay}")
+    print(f"  coste: mediana {np.median(cost):.4f}  p90 {np.percentile(cost,90):.4f}")
+
+    weak = margin < args.min_margin
+    print(f"  frames sin margen (<{args.min_margin}): {int(weak.sum())} "
+          f"({weak.mean():.1%}) -- son planos fijos, los sujeta el camino")
+
+    # Cobertura. Donde la referencia no tiene el material, el camino aparca en
+    # el frame menos malo y el coste se dispara; los umbrales estan calibrados
+    # contra RMSE de pixeles medido a mano (coste 0,001 -> RMSE 12 por detalle
+    # de la escena; coste 0,086 -> RMSE 27, o sea ningun parecido).
+    cov = cost < args.covered
+    dud = (cost >= args.covered) & (cost < args.uncovered)
+    nocov = cost >= args.uncovered
+    print(f"\n  COBERTURA: {cov.mean():.1%} cubierto, {dud.mean():.1%} dudoso, "
+          f"{nocov.mean():.1%} sin cobertura ({int(nocov.sum())/25:.0f}s "
+          f"de {cap.n/25:.0f}s)")
+    run = np.diff(np.concatenate(([0], nocov.view(np.int8), [0])))
+    ini, fin = np.nonzero(run == 1)[0], np.nonzero(run == -1)[0]
+    runs = sorted(zip(fin - ini, ini, fin), reverse=True)
+    if runs and runs[0][0] >= 25:
+        print("  tramos que la referencia no tiene:")
+        for L, i, j in runs[:8]:
+            if L < 25:
+                break
+            print(f"    base {i}-{j}  ({L} frames, {L/25:.1f}s)")
+
+    big = np.nonzero(d > 3)[0]
+    if len(big):
+        print(f"\n  saltos grandes (>3 frames), para mirarlos a ojo:")
+        for f in big[:20]:
+            print(f"    base {f} -> {f+1}: la referencia avanza {d[f]} frames")
+        if len(big) > 20:
+            print(f"    ... y {len(big)-20} mas")
+
+    out = args.out or os.path.join(args.ref, "refvideo", "align.json")
+    json.dump({"base": {"name": cap.name, "n": int(cap.n),
+                        "size": os.path.getsize(args.base)},
+               "ref": {"n": int(store.n)},
+               "params": {"band": args.band, "max_skip": args.max_skip,
+                          "lam": args.lam, "mu": args.mu},
+               "map": [int(x) for x in v],
+               "cost": [round(float(x), 5) for x in cost],
+               "margin": [round(float(x), 5) for x in margin],
+               "covered": [bool(x) for x in cov]},
+              open(out, "w"))
+    print(f"\nmapa guardado en {out}")
     return 0
 
 
@@ -620,6 +836,9 @@ def main():
     p.add_argument("--margin", type=int, default=30)
     p.add_argument("--threshold", type=float, default=20.0)
     p.add_argument("--hysteresis", type=float, default=0.20)
+    p.add_argument("--max-dist", type=int, default=25)
+    p.add_argument("--ref", help="directorio con el video de referencia ya "
+                                 "extraido y alineado (ver refextract/refalign)")
     p.add_argument("--budget", type=float, default=0,
                    help="segundos antes de parar limpiamente (0 = sin limite)")
     p.set_defaults(func=cmd_runall)
@@ -638,6 +857,65 @@ def main():
     p.add_argument("--tag", default="")
     p.add_argument("--out", default="work")
     p.set_defaults(func=cmd_map)
+
+    p = sub.add_parser("refextract",
+                       help="extrae un video de referencia (DVD) a luma cruda")
+    p.add_argument("video", help="fichero MPEG-2 / VOB")
+    p.add_argument("--out", required=True, help="directorio de trabajo")
+    p.set_defaults(func=cmd_refextract)
+
+    p = sub.add_parser("refalign",
+                       help="alinea el video de referencia con la cinta")
+    p.add_argument("base", help="captura base (.dv)")
+    p.add_argument("--ref", required=True,
+                   help="directorio de trabajo usado en refextract")
+    p.add_argument("--out", help="salida (por defecto <ref>/refvideo/align.json)")
+    p.add_argument("--band", type=int, default=60)
+    p.add_argument("--max-skip", type=int, default=24)
+    p.add_argument("--lam", type=float, default=0.010,
+                   help="penalizacion por frame de cinta saltado")
+    p.add_argument("--mu", type=float, default=0.060,
+                   help="penalizacion por frame que la referencia no tiene")
+    p.add_argument("--min-margin", type=float, default=0.03)
+    p.add_argument("--covered", type=float, default=0.02,
+                   help="coste por debajo del cual el frame se da por cubierto")
+    p.add_argument("--uncovered", type=float, default=0.05,
+                   help="coste por encima del cual la referencia no lo tiene")
+    p.set_defaults(func=cmd_refalign)
+
+    p = sub.add_parser("refclean",
+                       help="repara bloques falsamente sanos con la referencia")
+    p.add_argument("file")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--align", help="mapa cacheado (por defecto, junto a la referencia)")
+    p.add_argument("--thr-clean", type=float, default=20.0,
+                   help="umbral donde la imagen no cuadricula")
+    p.add_argument("--thr-broken", type=float, default=4.0,
+                   help="umbral donde si cuadricula")
+    p.add_argument("--trust", type=float, default=0.25)
+    p.add_argument("--max-ratio", type=float, default=2.5,
+                   help="desacuerdo maximo en relacion a lo que cuadricula")
+    p.add_argument("--chunk", type=int, default=500)
+    p.add_argument("--no-chroma", action="store_true")
+    p.add_argument("--band", type=int, default=80)
+    p.add_argument("--max-skip", type=int, default=8)
+    p.add_argument("--lam", type=float, default=0.050)
+    p.add_argument("--mu", type=float, default=0.004)
+    p.set_defaults(func=cmd_refclean)
+
+    p = sub.add_parser("stretch",
+                       help="pone una captura en la linea temporal de otra")
+    p.add_argument("src")
+    p.add_argument("--to", required=True, help="fichero que marca la linea temporal")
+    p.add_argument("--out", required=True)
+    p.add_argument("--band", type=int, default=80)
+    p.add_argument("--max-skip", type=int, default=8)
+    p.add_argument("--lam", type=float, default=0.050,
+                   help="penalizacion por saltar (aqui no se espera saltar)")
+    p.add_argument("--mu", type=float, default=0.004,
+                   help="penalizacion por congelar (aqui se espera congelar)")
+    p.set_defaults(func=cmd_stretch)
 
     args = ap.parse_args()
     return args.func(args)

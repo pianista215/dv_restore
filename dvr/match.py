@@ -648,6 +648,37 @@ def window_clips(base, donor_paths, lo, hi, out_dir, tag, margin=30,
     return made
 
 
+def save_index(idx, path):
+    """Guarda el indice: rutas de las capturas, agrupaciones y orden.
+
+    Se guardan las RUTAS, no los datos: los .dv son de solo lectura y pesan
+    gigabytes. Al cargarlo se vuelven a abrir por memmap.
+    """
+    import json
+    json.dump({"caps": [os.path.abspath(c.path) for c in idx.caps],
+               "clusters": [[[int(ci), int(f)] for ci, f in g]
+                            for g in idx.clusters],
+               "order": [int(k) for k in idx.order],
+               "stats": {k: (v if not hasattr(v, "tolist") else v.tolist())
+                         for k, v in idx.stats.items()}},
+              open(path, "w"))
+
+
+def load_index(path):
+    """Reabre un indice guardado. Falla claro si falta alguna captura."""
+    import json
+    from .dvfile import Capture
+    d = json.load(open(path))
+    missing = [p for p in d["caps"] if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            "el indice apunta a capturas que ya no estan:\n  "
+            + "\n  ".join(missing))
+    caps = [Capture(p) for p in d["caps"]]
+    clusters = [[(int(ci), int(f)) for ci, f in g] for g in d["clusters"]]
+    return TapeIndex(caps, clusters, [int(k) for k in d["order"]], d["stats"])
+
+
 def align_to_tape(idx, cap_index, out_path):
     """Escribe una captura estirada a la linea temporal real de la cinta.
 
