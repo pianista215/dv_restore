@@ -119,9 +119,24 @@ python3 dvr.py runall BAD.dv OTHERS*.dv --ref /path/with/room/work \
         --out /path/with/room/work --final /path/with/room/restored.dv
 ```
 
+There is a second, separate use, and on this tape it turned out to be the
+bigger one:
+
+```bash
+# repair macroblocks the camera calls healthy that carry garbage
+python3 dvr.py refclean restored.dv --ref /path/with/room/work \
+        --out /path/with/room/restored_clean.dv
+```
+
+`conceal` only ever touches macroblocks the camera marks with an error. Most of
+the damage you can actually *see* on this tape is not marked: it is garbage
+written with valid ECC, identical across every capture pass, so nothing
+internal can detect it. An outside observation can. Measured on one frame of
+the opening: 24 macroblocks marked with an error against 207 that disagree with
+the reference, and the ones you see are the second set.
+
 `refalign` reports how much of the tape the recording actually covers, which is
-the number that decides whether any of this is worth it. On the disc this was
-built for: 66.8% covered cleanly, 6.2% doubtful, 27% not covered at all.
+the number that decides whether any of this is worth it.
 
 What makes the two sources worth combining is that they fail differently. A
 DVD transfer has roughly constant quality whatever the picture is doing; our
@@ -143,6 +158,34 @@ dirt of its own, and where it does, it disagrees with the tape beside it and is
 rejected there and then. Taking the reference unconditionally is worse than not
 using it at all (median error 4.61 against 3.65); with the gate it is 3.12,
 where the best possible choice every time would be 2.96.
+
+### Three guards, and why a fixed threshold cannot work
+
+`refclean` is the part that needed the most care, because a transfer through an
+analog connection is soft and sits half a pixel to the side, so **every edge
+disagrees however correct it is**. Sweeping a fixed threshold, the ratio of
+what gets fixed to what gets spoiled saturates at 3.8x and never improves:
+at 4 it rewrites 23.4% of a clean frame and costs it 15.8% of its detail, at 16
+most of the repair is gone. There is no sweet spot.
+
+What works is asking our own picture rather than the reference, on three
+levels:
+
+1. **Is the reference in the right place?** Not a question the frame can answer
+   about itself - a wrecked but covered frame and an uncovered one score the
+   same (0.43 against 0.38). The neighbourhood answers it: a broken frame
+   inside a well-aligned run is still well aligned.
+2. **How broken is this zone?** Tape garbage and concealment mosaics do not
+   join their neighbours; a healthy picture does, however many edges it has.
+   The threshold is interpolated from that, which takes the ratio from 3.8x to
+   **26x** - 23 macroblocks per clean frame against 583 per damaged one.
+3. **Is the disagreement explainable?** If a frame disagrees far more than it
+   blocks, the one that is wrong is the outsider. Without this, single frames
+   with a misplaced reference - a pan, a cut - come out with 857 of 1620
+   macroblocks overwritten from the wrong instant, and the zone threshold
+   cannot help because the whole frame disagrees.
+
+`--thr-clean` and `--thr-broken` move the first dial, `--max-ratio` the last.
 
 ### For iterating and debugging
 
